@@ -1,0 +1,48 @@
+[package]
+name        = "kaas-consumer-canary"
+description = "Reads kaas-producer-canary's heartbeats and reports what is wrong with them, using kaas-lib."
+version     = "0.1.0"
+edition     = "2024"
+license     = "Apache-2.0"
+publish     = false
+
+[dependencies]
+# The library under test. The producer canary exercises kaas-lib's write path;
+# this exercises the read path, and against the one stream whose correct
+# contents are known in advance. A scan that drops a record is indistinguishable
+# from a cluster that lost one — unless something is counting.
+#
+# No `kafka-admin` on purpose. A consumer canary has no reason to hold a handle
+# that can create or delete a topic, and `kafka-read` re-exports the `Cluster`
+# it needs.
+kafka-read = "0.2"
+
+tokio  = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time"] }
+clap   = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+serde  = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# `bytes` to build a `Record` by hand, and tokio's clock so the tests that turn
+# on elapsed time — a reorder window closing, a run going silent — assert on it
+# instead of sleeping through it.
+bytes = "1"
+tokio = { version = "1.53", features = ["test-util"] }
+
+[lints.clippy]
+# Same rule 2 as kaas-lib, and for the same reason as the producer canary: this
+# process is meant to run for weeks. A panic here is worse, though — the
+# producer going quiet reads as "the cluster is down", but the consumer going
+# quiet reads as "nothing is wrong", which is the failure mode a monitor must
+# not have.
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"
+
+[lints.rust]
+unsafe_code = "forbid"

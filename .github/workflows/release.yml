@@ -1,0 +1,120 @@
+name: Release
+
+# Builds and publishes the container image to
+# ghcr.io/kaas-rs/kaas-consumer-canary.
+#
+# Reversible, unlike a crates.io publish: a container tag can be overwritten,
+# and a bad one is simply never referenced by the GitOps repo. So this runs on
+# every push to main (as `main` / `sha-<short>`) as well as on a version tag.
+#
+# `latest` only ever moves on a tag. A deployment pinned to `latest` and a
+# `main` build clobbering it is how a cluster ends up running a commit nobody
+# released — which is also why the manifests in the cluster repo pin a digest
+# rather than following a tag at all.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/kaas-rs/kaas-consumer-canary
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # cosign signs keylessly against the GitHub OIDC issuer.
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: v1.7.7
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xz -C /tmp actionlint
+          /tmp/actionlint -color
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # No `{{major}}` pattern: on a 0.x tag it emits nothing anyway, and
+          # a `:0` tag would claim compatibility across a range that 0.x makes
+          # no promise about.
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # linux/amd64 only: the cluster is a single amd64 node, and
+          # cross-building arm64 under QEMU would cost minutes for nothing.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # The digest is what the GitOps manifests pin, so print it where whoever
+      # is updating them can copy it, rather than making them go and look it
+      # up in the registry.
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo "To deploy, pin this alongside the producer canary in the"
+            echo "cluster repo and sync:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,7 @@
+edition                  = "2024"
+max_width                = 100
+reorder_imports          = true
+use_field_init_shorthand = true
+
+# imports_granularity and group_imports remain nightly-only. Re-enable
+# once they stabilize.

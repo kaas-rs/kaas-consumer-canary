@@ -1,0 +1,93 @@
+name: CI
+
+# fmt, clippy, tests and a container build. Everything here runs on
+# GitHub-hosted runners rather than the cluster's ARC scale sets: nothing in
+# this workflow needs to reach the cluster, and a public repo on privileged
+# DinD runners with a hostPath mount is a fork pull request away from being
+# somebody else's shell.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # First, and deliberately. A workflow expression error is not a runtime
+      # failure: GitHub creates the run, fails it in zero seconds with no jobs
+      # and no logs, and `--log-failed` reports only "log not found". kaas-lib
+      # shipped one that made every release run red for its entire existence.
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: v1.7.7
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xz -C /tmp actionlint
+          /tmp/actionlint -color
+
+      - name: Install Rust toolchain (honours rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+  # Build the image on every change, without publishing. The Dockerfile has
+  # its own failure modes that `cargo build` cannot reach — the dependency
+  # pre-build layer and the stub-source trick in particular — and finding them
+  # at release time means finding them when you wanted to ship.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: kaas-consumer-canary:ci
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # An image that builds and then does nothing is the failure the stub
+      # layer in the Dockerfile can produce, and it is invisible to a build
+      # that only checks the exit code. `--help` proves the real binary is in
+      # there; there is no shell in a distroless image to prove it any other
+      # way.
+      - name: The image contains a program that runs
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm kaas-consumer-canary:ci --help)
+          echo "$out"
+          echo "$out" | grep -q -- '--bootstrap'
+
+      - name: Report the image size
+        run: |
+          size=$(docker image inspect kaas-consumer-canary:ci --format '{{.Size}}')
+          printf 'image size: %s MB\n' "$((size / 1000000))" >> "$GITHUB_STEP_SUMMARY"
