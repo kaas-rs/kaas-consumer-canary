@@ -1,10 +1,23 @@
 name: CI
 
-# fmt, clippy, tests and a container build. Everything here runs on
-# GitHub-hosted runners rather than the cluster's ARC scale sets: nothing in
-# this workflow needs to reach the cluster, and a public repo on privileged
-# DinD runners with a hostPath mount is a fork pull request away from being
-# somebody else's shell.
+# fmt, clippy, tests and a container build.
+#
+# Self-hosted: `arc-runner-set-consumer-canary` is an ARC scale set on the
+# kaas-rs k3s cluster (see Woestebanaan/k3s-cluster, apps/arc-runners).
+#
+# Jobs reachable from a *fork* pull request must not land there. The runner
+# pods are privileged DinD with a hostPath mount onto the node, and this repo
+# is public — a fork PR is arbitrary code from a stranger, and it would be
+# running as root beside the two Kafka clusters this canary is supposed to be
+# watching. Both jobs here are wired to `pull_request`, so both pick their
+# runner per event: forks go to GitHub-hosted, everything else to ARC.
+#
+# `github.event.pull_request` is null for push and workflow_dispatch, so the
+# expression falls through to ARC for those.
+#
+# Every step below is written to work on either runner. The ARC image
+# (ghcr.io/actions/actions-runner) is minimal — no cc, no gcc, no linker — so
+# the toolchain steps install what is missing and no-op where it is not.
 
 on:
   push:
@@ -22,14 +35,35 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'arc-runner-set-consumer-canary' }}
     steps:
+      # `ring` — reached through rustls, through kaas-lib — has a build script
+      # that needs a working C compiler and linker. The ARC image has neither;
+      # ubuntu-latest has both, so this is a no-op there.
+      - name: Install C toolchain
+        run: |
+          if command -v cc >/dev/null 2>&1; then
+            echo "cc already present: $(command -v cc)"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
+          else
+            echo "::error::no cc, not root, and no sudo — cannot build native deps"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends \
+            gcc libc6-dev pkg-config ca-certificates
+          echo "cc → $(command -v cc || echo MISSING)"
+
       - uses: actions/checkout@v6
 
-      # First, and deliberately. A workflow expression error is not a runtime
+      # Early, and deliberately. A workflow expression error is not a runtime
       # failure: GitHub creates the run, fails it in zero seconds with no jobs
       # and no logs, and `--log-failed` reports only "log not found". kaas-lib
       # shipped one that made every release run red for its entire existence.
+      # The `runs-on` expression above is exactly that class of thing.
       - name: actionlint
         env:
           ACTIONLINT_VERSION: v1.7.7
@@ -41,8 +75,31 @@ jobs:
 
       - name: Install Rust toolchain (honours rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      # The ARC runners intermittently start a job with the toolchain installed
+      # but not on PATH: `cargo: command not found` from a step whose "Install
+      # Rust toolchain" reported success. It has bitten kaas-lib on consecutive
+      # runs of an unchanged workflow. Re-export the directory explicitly rather
+      # than trusting PATH to be inherited, and prove cargo runs *here*, so a
+      # broken environment fails at setup with a legible message instead of as
+      # a bare exit 127 several minutes later.
+      - name: Put cargo on PATH, and prove it
+        run: |
+          set -eu
+          for dir in "${CARGO_HOME:-$HOME/.cargo}/bin" "$HOME/.cargo/bin" /usr/local/cargo/bin; do
+            if [ -x "$dir/cargo" ]; then
+              printf '%s\n' "$dir" >> "$GITHUB_PATH"
+              echo "cargo -> $dir"
+              "$dir/cargo" --version
+              exit 0
+            fi
+          done
+          echo "::error::no cargo found (looked in CARGO_HOME, ~/.cargo, /usr/local/cargo)"
+          exit 1
 
       - name: cargo fmt
         run: cargo fmt --check
@@ -58,11 +115,30 @@ jobs:
   # pre-build layer and the stub-source trick in particular — and finding them
   # at release time means finding them when you wanted to ship.
   image:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'arc-runner-set-consumer-canary' }}
     steps:
+      # On ARC, docker comes from the DinD sidecar, which is not ready the
+      # instant the runner container starts. On ubuntu-latest the daemon is
+      # already up and this exits on the first iteration.
+      - name: Wait for Docker daemon
+        run: |
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          for i in $(seq 1 30); do
+            if docker info >/dev/null 2>&1; then
+              echo "docker daemon ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::docker daemon did not become ready"
+          docker info || true
+          exit 1
+
       - uses: actions/checkout@v6
 
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
 
       - name: Build (no push)
         uses: docker/build-push-action@v6

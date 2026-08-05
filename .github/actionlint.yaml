@@ -1,0 +1,10 @@
+# `arc-runner-set-consumer-canary` is an ARC scale set on the kaas-rs k3s
+# cluster (Woestebanaan/k3s-cluster, apps/arc-runners), not a GitHub-hosted
+# label, so actionlint cannot know it exists. Declaring it here keeps the
+# linter's runner-label check useful for genuine typos rather than permanently
+# noisy — and the check is worth keeping, because a mistyped scale set name
+# does not fail: the job queues forever waiting for a runner that will never
+# come. See the runner comment at the top of ci.yml.
+self-hosted-runner:
+  labels:
+    - arc-runner-set-consumer-canary

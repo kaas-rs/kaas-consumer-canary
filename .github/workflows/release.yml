@@ -11,6 +11,13 @@ name: Release
 # `main` build clobbering it is how a cluster ends up running a commit nobody
 # released — which is also why the manifests in the cluster repo pin a digest
 # rather than following a tag at all.
+#
+# Runs on `arc-runner-set-consumer-canary`, the repo's ARC scale set on the
+# kaas-rs k3s cluster (Woestebanaan/k3s-cluster, apps/arc-runners), with the
+# scale set named directly rather than through ci.yml's fork expression: the
+# triggers here are push-to-main, a version tag and workflow_dispatch, none of
+# which a fork pull request can reach. `containerMode: dind` supplies the
+# privileged Docker daemon that buildx and the GHA cache need.
 
 on:
   push:
@@ -30,15 +37,41 @@ env:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set-consumer-canary
     permissions:
       contents: read
       packages: write
-      # cosign signs keylessly against the GitHub OIDC issuer.
+      # cosign signs keylessly against the GitHub OIDC issuer. It works the
+      # same from a self-hosted runner: the token comes from GitHub, not from
+      # the machine.
       id-token: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+    env:
+      # docker/build-push-action uploads buildx "build records" as Actions
+      # artifacts by default. They duplicate provenance metadata that already
+      # lives on the GHCR image and consume the account-wide Actions storage
+      # quota, so turn them off — the digest below is what anyone actually
+      # needs from this run.
+      DOCKER_BUILD_SUMMARY: "false"
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     steps:
+      # Docker comes from the ARC DinD sidecar, which is not ready the instant
+      # the runner container starts.
+      - name: Wait for Docker daemon
+        run: |
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          for i in $(seq 1 30); do
+            if docker info >/dev/null 2>&1; then
+              echo "docker daemon ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::docker daemon did not become ready"
+          docker info || true
+          exit 1
+
       - uses: actions/checkout@v6
 
       - name: actionlint
@@ -51,6 +84,8 @@ jobs:
           /tmp/actionlint -color
 
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
 
       - uses: docker/login-action@v3
         with:
