@@ -7,22 +7,21 @@
 //! whole of what it knows: an acknowledgement is a statement about the leader's
 //! log at one instant, not about what a reader will find there later. Every
 //! interesting failure — a record acknowledged and then lost to an unclean
-//! leader election, a duplicate, a batch that will not decode, a topic whose
-//! high watermark stops advancing — is invisible from the writing end.
+//! leader election, a duplicate, a topic whose high watermark stops advancing —
+//! is invisible from the writing end.
 //!
 //! This reads the stream back and checks it, which is possible here and almost
 //! nowhere else: the correct contents are known in advance. Every heartbeat's
 //! `sequence` is exactly one more than the last, so anything else is a finding
 //! rather than an interpretation.
 //!
-//! # It reports six things, and they are not the same thing
+//! # It reports five things, and they are not the same thing
 //!
 //! * **Loss** — a `sequence` that never arrives. The finding the topology
 //!   exists to catch.
-//! * **Duplication** — a `sequence` that arrives twice. `kafka-produce` has no
-//!   idempotence and deliberately never retries an ambiguous send, so it should
-//!   be impossible for the producer to cause one; seeing one means the broker
-//!   or the read path did.
+//! * **Duplication** — a `sequence` that arrives twice. The producer runs
+//!   idempotently as of kaas-lib 0.3.0, so it should be impossible for it to
+//!   cause one; seeing one means the broker or the read path did.
 //! * **A pause** — consecutive sequences whose body timestamps are far apart.
 //!   The producer stopped and nothing was lost, which is the row of the
 //!   producer's table that must not be confused with the first one.
@@ -31,8 +30,43 @@
 //! * **Silence** — the current run stops arriving. Distinct from loss because
 //!   nothing has yet been proven missing; the writer may be down, the read path
 //!   may be stalled, and the canary says so rather than guessing.
-//! * **Latency** — how old a heartbeat is when it is read. Apparent, because it
-//!   is measured across two hosts' clocks; see `skew` below.
+//!
+//! Latency is measured too, and reported, but it is not a finding in the same
+//! sense: it is apparent rather than measured, because it spans two hosts'
+//! clocks. See `check_latency`.
+//!
+//! ## What consuming cannot see, and reading could
+//!
+//! There used to be a sixth: **undecodable batches**. `kafka-read`'s scan
+//! surfaces `ScanEvent::Malformed`, so a batch the tolerant decoder rejected
+//! was a countable finding on a topic where every batch came from one known
+//! writer. [`kafka_consume::GroupConsumer::poll`] returns `Vec<Record>` and
+//! handles `RecordOutcome::Malformed` internally by stepping the position past
+//! it — deliberately, so one corrupt record cannot stall a partition, but the
+//! caller is never told. The check is gone rather than quietly always-zero: a
+//! counter that cannot rise is worse than an absent one, because a dashboard
+//! reads it as evidence.
+//!
+//! # Group membership, not a scan
+//!
+//! The read path here is a KIP-848 group member. That is the substantive change
+//! from the scan this used to be, and it moves three things out of this process
+//! and into the broker:
+//!
+//! * **Where to resume.** Offsets are committed to the group, so a restart
+//!   continues where the last commit left off instead of re-deriving a position
+//!   from the last record's timestamp.
+//! * **Which partitions.** The broker assigns them. There is no `--partition`
+//!   any more, because a group member does not get to choose.
+//! * **Where to start.** A member with no committed offset starts at the
+//!   *earliest* retained record — `kafka-consume` policy, not a setting — so
+//!   the first run under a new `--group` replays the topic. There is no
+//!   `--from-earliest` because there is no alternative to opt out of.
+//!
+//! The replay matters less than it sounds: `caught_up` below suppresses latency
+//! findings until the reader reaches the live end, and sequence checks over
+//! history are still true statements about that history. It is noise on first
+//! start and nothing thereafter.
 //!
 //! # Quiet when healthy
 //!
@@ -44,8 +78,8 @@
 //! # Out-of-order arrival is not loss
 //!
 //! `sequence` is global to a run, but the records are spread over partitions,
-//! and a scan merges partitions by timestamp rather than by sequence. A record
-//! can therefore arrive slightly before one that precedes it. A missing
+//! and a poll returns them per partition rather than in sequence order. A
+//! record can therefore arrive slightly before one that precedes it. A missing
 //! sequence is held for a reorder window before it is called lost — see
 //! [`Watch::sweep`]. With the whole stream in one partition, which is what
 //! KIP-480 sticky partitioning gives an unkeyed producer, the window never
@@ -53,10 +87,10 @@
 //!
 //! # Failure policy
 //!
-//! A finding is logged and counted; the loop continues. A dropped scan is
-//! re-established and the reader resumes near where it stopped, because a
-//! reader that exits when the broker restarts reports nothing about the restart
-//! — which is the interval most worth reporting on.
+//! A finding is logged and counted; the loop continues. A failed poll is
+//! re-established and the member rejoins, because a reader that exits when the
+//! broker restarts reports nothing about the restart — which is the interval
+//! most worth reporting on.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // Tests may unwrap freely: a panic there is a failed assertion, which is the
@@ -70,10 +104,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use futures::StreamExt;
-use kafka_read::{
-    Cluster, ClusterConfig, Record, ScanEvent, ScanSpec, StartPosition, TimestampType,
-};
+use kafka_consume::{Cluster, ClusterConfig, ConsumerConfig, GroupConsumer, Record};
+// `kafka-consume` re-exports `Record` but not `TimestampType`, which is the
+// type of one of `Record`'s own fields — so matching on it needs the crate the
+// record came from. Not a duplicate read path: `kafka-consume` depends on
+// `kafka-read` for exactly this decoder, and both resolve to one version.
+use kafka_read::TimestampType;
 use serde::Deserialize;
 use tokio::time::Instant;
 
@@ -112,6 +148,28 @@ struct Args {
     #[arg(long, env = "KAAS_CANARY_TOPIC", default_value = "kaas-canary")]
     topic: String,
 
+    /// The consumer group to join.
+    ///
+    /// Committed offsets live under this name, so it decides what a restart
+    /// resumes from. A group nobody has used before starts at the earliest
+    /// retained record and replays the topic once.
+    #[arg(
+        long,
+        env = "KAAS_CANARY_GROUP",
+        default_value = "kaas-consumer-canary"
+    )]
+    group: String,
+
+    /// Join as a static member under this instance id.
+    ///
+    /// Without one, every restart is a rebalance. With one, a restart inside
+    /// the session timeout keeps the same assignment — which for a canary is
+    /// the difference between a deploy showing up as a gap in coverage and not
+    /// showing up at all. Set it to something stable per replica; the pod name
+    /// is the obvious choice.
+    #[arg(long, env = "KAAS_CANARY_INSTANCE_ID")]
+    instance_id: Option<String>,
+
     /// The interval the producer is writing at.
     ///
     /// Not used to time anything — this process is driven by what arrives —
@@ -119,19 +177,6 @@ struct Args {
     /// reader configured from the same environment agree by construction.
     #[arg(long, env = "KAAS_CANARY_INTERVAL_MS", default_value_t = 1_000)]
     interval_ms: u64,
-
-    /// Start at the beginning of the topic rather than at its end.
-    ///
-    /// Off by default. A canary reports on the cluster it is watching now; a
-    /// replay of a week of retained heartbeats reports on a week of history,
-    /// and every one of its findings is about a cluster that has since been
-    /// restarted, resized or repaired.
-    #[arg(long, env = "KAAS_CANARY_FROM_EARLIEST")]
-    from_earliest: bool,
-
-    /// Read only this partition.
-    #[arg(long)]
-    partition: Option<i32>,
 
     /// Missed heartbeats before silence is reported.
     #[arg(long, default_value_t = 5)]
@@ -153,6 +198,14 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     summary_secs: u64,
 
+    /// How often to commit the group's offsets. Zero to never.
+    ///
+    /// A commit is what a restart resumes from, so this is the width of the
+    /// window a crash re-reads. Re-reading is harmless — [`Run::replay_below`]
+    /// absorbs it — so the setting trades duplicate work against nothing much.
+    #[arg(long, default_value_t = 10)]
+    commit_secs: u64,
+
     /// Stop after this many heartbeats. Runs forever when unset.
     #[arg(long)]
     count: Option<u64>,
@@ -161,11 +214,11 @@ struct Args {
     ///
     /// Off by default, because the deployed canary's job is to keep reporting,
     /// and a process that exits stops being a monitor. With `--count` it turns
-    /// this into an acceptance check. Restarts, pauses, reordering, reconnects
+    /// this into an acceptance check. Restarts, pauses, reordering, rebalances
     /// and slow heartbeats do not count: they are observations about timing,
     /// and the producer's own documentation is explicit that a pause is not
-    /// loss. Loss, duplication, silence, undecodable batches, unparseable
-    /// payloads and mislabelled records do.
+    /// loss. Loss, duplication, silence, unparseable payloads and mislabelled
+    /// records do.
     #[arg(long)]
     strict: bool,
 }
@@ -210,7 +263,8 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         topic = %args.topic,
-        from = if args.from_earliest { "earliest" } else { "latest" },
+        group = %args.group,
+        instance_id = args.instance_id.as_deref().unwrap_or("<dynamic>"),
         interval_ms = args.interval_ms,
         stall_ms = watch.stall.as_millis(),
         reorder_ms = watch.reorder.as_millis(),
@@ -239,33 +293,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Read the topic, re-establishing the scan for as long as the process lives.
+/// Read the topic, rejoining the group for as long as the process lives.
 ///
-/// The cluster handle is dropped along with the scan rather than reused. It
-/// costs one metadata round trip per reconnect, against a one-second floor on
-/// the backoff, and it means there is no cached routing state that can outlive
-/// the failure that ended the scan — a canary wedged onto a stale leader is a
-/// canary reporting silence about a healthy cluster.
+/// The cluster handle is dropped along with the member rather than reused. It
+/// costs one metadata round trip per rejoin, against a one-second floor on the
+/// backoff, and it means there is no cached routing state that can outlive the
+/// failure that ended the session — a canary wedged onto a stale coordinator is
+/// a canary reporting silence about a healthy cluster.
 async fn watch_topic(bootstrap: &[String], args: &Args, watch: &mut Watch) -> Result<()> {
     const FIRST_BACKOFF: Duration = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
     let mut backoff = FIRST_BACKOFF;
-    let mut first = true;
     loop {
         let outcome = match Cluster::connect(bootstrap.to_vec(), ClusterConfig::default()).await {
             Ok(cluster) => {
                 backoff = FIRST_BACKOFF;
-                read_session(&cluster, args, watch, first).await
+                read_session(cluster, args, watch).await
             }
             Err(error) => Err(anyhow::Error::new(error).context("connecting to the cluster")),
         };
-        first = false;
 
         match outcome {
             Ok(()) => return Ok(()),
             Err(error) => {
-                watch.reconnecting(&error);
+                watch.rejoining(&error);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -273,27 +325,23 @@ async fn watch_topic(bootstrap: &[String], args: &Args, watch: &mut Watch) -> Re
     }
 }
 
-/// One scan, from its start to whatever ends it.
+/// One group membership, from the join to whatever ends it.
 ///
 /// Returns `Ok` only when the run is genuinely over — the `--count` limit — so
 /// every other exit is an error and gets retried by the caller.
-async fn read_session(
-    cluster: &Cluster,
-    args: &Args,
-    watch: &mut Watch,
-    first: bool,
-) -> Result<()> {
-    let mut spec = ScanSpec::new(&args.topic)
-        .from(watch.resume_from(args, first))
-        .following();
-    if let Some(partition) = args.partition {
-        spec = spec.with_partitions([partition]);
-    }
+async fn read_session(cluster: Cluster, args: &Args, watch: &mut Watch) -> Result<()> {
+    let mut consumer = GroupConsumer::subscribe(
+        cluster,
+        ConsumerConfig::new(),
+        args.group.clone(),
+        [args.topic.clone()],
+    )
+    .await
+    .context("joining the group")?;
 
-    let stream = kafka_read::scan(cluster, spec)
-        .await
-        .context("starting the scan")?;
-    futures::pin_mut!(stream);
+    if let Some(instance_id) = &args.instance_id {
+        consumer = consumer.instance_id(instance_id.clone());
+    }
 
     // Everything that is not driven by an arriving record — silence, and a
     // missing sequence ageing out of its reorder window — needs a clock of its
@@ -308,29 +356,50 @@ async fn read_session(
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut summary_at = Instant::now();
+    let mut commit_at = Instant::now();
+    let mut assignment = consumer.assignment();
 
     loop {
         tokio::select! {
-            // `StreamExt::next` is cancel-safe here: `scan` is a
-            // `stream::unfold`, which parks its in-progress future inside the
-            // stream, so a fetch interrupted by a watchdog tick resumes rather
-            // than restarts.
-            event = stream.next() => match event {
-                Some(Ok(event)) => {
-                    watch.observe(event);
+            // Cancel-safe by the workspace's rule 5: a poll interrupted by a
+            // watchdog tick leaves any pending rebalance in place rather than
+            // acknowledging an assignment nobody was told about.
+            polled = consumer.poll() => {
+                let records = polled.map_err(anyhow::Error::new).context("polling")?;
+
+                // The broker moved partitions under us. Whatever the new ones
+                // hold has been read from their committed offset, so the
+                // sequences either side of it arrive again and are replays
+                // rather than duplicates — the same reasoning as a rejoin.
+                let current = consumer.assignment();
+                if current != assignment {
+                    watch.rebalanced(&assignment, &current);
+                    assignment = current;
+                }
+
+                for record in &records {
+                    watch.observe_record(record);
                     if let Some(limit) = args.count
                         && watch.tally.heartbeats >= limit
                     {
+                        // Commit before leaving, so an acceptance run does not
+                        // make the next one replay what it just checked.
+                        commit(&consumer, watch).await;
+                        let _ = consumer.leave().await;
                         return Ok(());
                     }
                 }
-                Some(Err(error)) => return Err(anyhow::Error::new(error).context("scanning")),
-                // A following scan does not end on its own, so this is the
-                // stream having been ended for it.
-                None => anyhow::bail!("the scan ended while it was still following"),
-            },
+            }
             now = watchdog.tick() => {
                 watch.sweep(now);
+
+                if args.commit_secs > 0
+                    && now.duration_since(commit_at) >= Duration::from_secs(args.commit_secs)
+                {
+                    commit_at = now;
+                    commit(&consumer, watch).await;
+                }
+
                 if args.summary_secs > 0
                     && now.duration_since(summary_at) >= Duration::from_secs(args.summary_secs)
                 {
@@ -342,6 +411,30 @@ async fn read_session(
     }
 }
 
+/// Commit the group's offsets, and say so only when it goes wrong.
+///
+/// Per-partition results, per the workspace's rule 4: committing four
+/// partitions where one is mid-reassignment succeeds for three, and reporting
+/// the whole call as failed would hide that. A failed commit is not a finding
+/// about the stream — it costs a replay after a restart and nothing else — so
+/// it is a warning rather than a fault.
+async fn commit(consumer: &GroupConsumer, watch: &mut Watch) {
+    match consumer.commit().await {
+        Ok(results) => {
+            for ((topic, partition), result) in results {
+                if let Err(error) = result {
+                    watch.tally.commit_failures += 1;
+                    tracing::warn!(%topic, partition, %error, "could not commit an offset");
+                }
+            }
+        }
+        Err(error) => {
+            watch.tally.commit_failures += 1;
+            tracing::warn!(%error, "the commit did not reach the coordinator");
+        }
+    }
+}
+
 /// Everything counted over the life of the process.
 #[derive(Debug, Default)]
 struct Tally {
@@ -349,14 +442,15 @@ struct Tally {
     lost: u64,
     duplicates: u64,
     silences: u64,
-    undecodable: u64,
     unparseable: u64,
     mislabelled: u64,
     restarts: u64,
     pauses: u64,
     reordered: u64,
     replayed: u64,
-    reconnects: u64,
+    rejoins: u64,
+    rebalances: u64,
+    commit_failures: u64,
     slow: u64,
     max_latency_ms: i64,
     min_latency_ms: Option<i64>,
@@ -365,15 +459,10 @@ struct Tally {
 
 impl Tally {
     /// What `--strict` fails on: the counts that mean the stream was not what
-    /// the producer wrote. Restarts, pauses, reordering, reconnects and slow
-    /// heartbeats are timing, not corruption.
+    /// the producer wrote. Restarts, pauses, reordering, rejoins, rebalances,
+    /// failed commits and slow heartbeats are timing, not corruption.
     fn faults(&self) -> u64 {
-        self.lost
-            + self.duplicates
-            + self.silences
-            + self.undecodable
-            + self.unparseable
-            + self.mislabelled
+        self.lost + self.duplicates + self.silences + self.unparseable + self.mislabelled
     }
 }
 
@@ -384,9 +473,9 @@ struct Run {
     expected: u64,
     /// Sequences that have not arrived, and when each was first missed.
     missing: BTreeMap<u64, Instant>,
-    /// Sequences below this were already accounted for before a reconnect, so
-    /// seeing one again is a replay rather than a duplicate. Zero once the
-    /// reader has moved past the resume point.
+    /// Sequences below this were already accounted for before a rejoin or a
+    /// rebalance, so seeing one again is a replay rather than a duplicate. Zero
+    /// once the reader has moved past the resume point.
     replay_below: u64,
     /// The body timestamp of the last heartbeat, for telling a pause from a gap.
     last_beat_ms: i64,
@@ -412,9 +501,6 @@ struct Watch {
     /// How long the current run may be quiet before that is a finding.
     stall: Duration,
     lag_warn_ms: i64,
-    /// The record timestamp of the last record read, so a reconnect can resume
-    /// beside it rather than at the log end.
-    resume_ms: Option<i64>,
     /// Whether the broker's timestamp rewriting has already been reported. It
     /// is a topic setting, not an event, so it is worth saying exactly once.
     log_append_reported: bool,
@@ -424,7 +510,7 @@ struct Watch {
     /// by the only definition available here. That is not a finding, it is a
     /// description of what was asked for — and at one line per record it is
     /// precisely the noise that hides a real one. Latency is measured from the
-    /// first fresh record onwards, and disarmed again by a reconnect, whose
+    /// first fresh record onwards, and disarmed again by a rejoin, whose
     /// backlog is a replay for the same reason.
     caught_up: bool,
     /// Whether latency is currently over the threshold. Reported on the way in
@@ -444,7 +530,6 @@ impl Watch {
             reorder,
             stall,
             lag_warn_ms,
-            resume_ms: None,
             log_append_reported: false,
             caught_up: false,
             lagging: false,
@@ -453,79 +538,44 @@ impl Watch {
         }
     }
 
-    /// Where the next scan should start.
-    ///
-    /// After a reconnect, at the timestamp of the last record read rather than
-    /// after it: `StartPosition::Timestamp` resolves to the first record at or
-    /// after the instant, and several heartbeats can share a millisecond, so
-    /// starting one millisecond later would skip records and report them as
-    /// lost. Re-reading the last record instead costs one replay, which
-    /// [`Run::replay_below`] absorbs.
-    fn resume_from(&self, args: &Args, first: bool) -> StartPosition {
-        match self.resume_ms {
-            Some(timestamp) => StartPosition::Timestamp(timestamp),
-            None if first && args.from_earliest => StartPosition::Earliest,
-            // Nothing has been read yet, so there is no position to resume:
-            // start where a fresh canary starts. A reconnect that lands here
-            // skipped whatever was written meanwhile, and cannot know it did.
-            None => StartPosition::Latest,
-        }
+    /// Note that the session died and the reader is about to rejoin.
+    fn rejoining(&mut self, error: &anyhow::Error) {
+        self.tally.rejoins += 1;
+        self.open_replay_window();
+        tracing::warn!(error = %format!("{error:#}"), "the read stopped; rejoining");
     }
 
-    /// Note that the scan died and the reader is about to start another.
-    fn reconnecting(&mut self, error: &anyhow::Error) {
-        self.tally.reconnects += 1;
-        // Every known run's position becomes a replay boundary: the resume
-        // re-reads from the last record's timestamp, so the sequences either
-        // side of it arrive a second time and are not duplicates.
+    /// Note that the broker moved partitions between polls.
+    ///
+    /// Not a fault. It is the group protocol working — a member joined or left
+    /// — and the only consequence here is that a gained partition resumes from
+    /// its committed offset, which re-reads a little.
+    fn rebalanced(&mut self, before: &[(String, i32)], after: &[(String, i32)]) {
+        self.tally.rebalances += 1;
+        self.open_replay_window();
+        tracing::info!(
+            was = before.len(),
+            now = after.len(),
+            "the assignment changed"
+        );
+    }
+
+    /// Everything already counted becomes re-readable without being a duplicate.
+    ///
+    /// Shared by a rejoin and a rebalance because they resume the same way:
+    /// from a committed offset that is at or behind what has been seen. The
+    /// backlog that arrives is a replay, so latency is disarmed too.
+    fn open_replay_window(&mut self) {
         for run in self.runs.values_mut() {
             run.replay_below = run.expected;
         }
-        // Whatever was written during the outage arrives in a burst of old
-        // records, which is a replay and not a latency finding.
         self.caught_up = false;
         self.lagging = false;
         self.backlog_records = 0;
         self.backlog_worst_ms = 0;
-        tracing::warn!(error = %format!("{error:#}"), "the read stopped; reconnecting");
-    }
-
-    /// Take one event from the scan.
-    fn observe(&mut self, event: ScanEvent) {
-        match event {
-            ScanEvent::Record(record) => self.observe_record(&record),
-            ScanEvent::Malformed {
-                partition,
-                offset,
-                last_offset,
-                raw,
-                reason,
-                ..
-            } => {
-                // The read path's whole tolerant-decoding design is that this
-                // does not end the scan. On this topic it is also unambiguous:
-                // every batch was written by the producer canary, so a batch
-                // that will not decode is either a broker or a codec fault.
-                self.tally.undecodable += 1;
-                tracing::error!(
-                    partition,
-                    offset,
-                    last_offset,
-                    bytes = raw.len(),
-                    %reason,
-                    "a batch would not decode"
-                );
-            }
-            ScanEvent::PartitionComplete { .. } | ScanEvent::Progress(_) => {}
-            ScanEvent::Done(progress) => {
-                tracing::debug!(?progress, "the scan reported itself done");
-            }
-        }
     }
 
     fn observe_record(&mut self, record: &Record) {
-        self.resume_ms = Some(record.timestamp);
-
         let Some(value) = &record.value else {
             // A tombstone here is a record with a null value on a topic that
             // only ever carries heartbeats, so somebody else is writing.
@@ -697,9 +747,9 @@ impl Watch {
                 beat.run_id.clone(),
                 Run {
                     // Seeded from the first sequence seen, not from 1. A reader
-                    // that starts at the log end joins a run in progress, and
-                    // retention can drop the beginning of one that started
-                    // earlier; neither is a gap.
+                    // that joins a group with no committed offset starts at the
+                    // earliest *retained* record, and retention can drop the
+                    // beginning of a run; that is not a gap.
                     expected: beat.sequence,
                     missing: BTreeMap::new(),
                     replay_below: 0,
@@ -724,7 +774,7 @@ impl Watch {
             Ordering::Less => {
                 if run.missing.remove(&beat.sequence).is_some() {
                     // It was held as missing and it turned up: the partitions
-                    // merged out of order, which is what the window is for.
+                    // arrived out of order, which is what the window is for.
                     self.tally.reordered += 1;
                     tracing::debug!(sequence = beat.sequence, "arrived out of order");
                 } else if beat.sequence < run.replay_below {
@@ -869,14 +919,15 @@ impl Watch {
             lost = self.tally.lost,
             duplicates = self.tally.duplicates,
             silences = self.tally.silences,
-            undecodable = self.tally.undecodable,
             unparseable = self.tally.unparseable,
             mislabelled = self.tally.mislabelled,
             restarts = self.tally.restarts,
             pauses = self.tally.pauses,
             reordered = self.tally.reordered,
             replayed = self.tally.replayed,
-            reconnects = self.tally.reconnects,
+            rejoins = self.tally.rejoins,
+            rebalances = self.tally.rebalances,
+            commit_failures = self.tally.commit_failures,
             slow = self.tally.slow,
             latency_ms = self.tally.last_latency_ms,
             max_latency_ms = self.tally.max_latency_ms,
@@ -949,7 +1000,9 @@ mod tests {
         assert_eq!(parsed.timestamp_ms, 1_785_686_674_238);
     }
 
-    /// A producer that adds a field must not blind its monitor.
+    /// A producer that adds a field must not blind its monitor. `canary-version`
+    /// arrived in the producer's 0.2.0 as a header rather than a body field,
+    /// but the next one may not.
     #[test]
     fn an_added_field_does_not_break_the_reader() {
         let json = r#"{"run_id":"abc-1","sequence":7,"timestamp_ms":1785686674238,"timestamp":"2026-08-02T16:04:34.238Z","host":"canary-0","region":"eu-west"}"#;
@@ -966,8 +1019,9 @@ mod tests {
         assert_eq!(watch.tally.faults(), 0);
     }
 
-    /// The reader joins a run in progress — starting at the log end, or after
-    /// retention dropped the beginning. Sequence 500 first is not 499 lost.
+    /// The reader joins a run in progress — after retention dropped the
+    /// beginning, or from a committed offset. Sequence 500 first is not 499
+    /// lost.
     #[test]
     fn joining_mid_run_is_not_a_gap() {
         let mut watch = watch();
@@ -988,8 +1042,8 @@ mod tests {
         assert_eq!(watch.tally.lost, 3, "sequences 2, 3 and 4");
     }
 
-    /// The reason a hole is held rather than reported: partitions merge by
-    /// timestamp, so a later sequence can arrive first.
+    /// The reason a hole is held rather than reported: a poll returns records
+    /// per partition, so a later sequence can arrive first.
     #[test]
     fn a_hole_that_fills_in_time_is_only_reordering() {
         let mut watch = watch();
@@ -1011,16 +1065,16 @@ mod tests {
         assert_eq!(watch.tally.duplicates, 1);
     }
 
-    /// After a reconnect the scan resumes at the last record's timestamp, so
-    /// the records around it arrive again. Counting those as duplicates would
-    /// make every broker restart look like a broken producer.
+    /// After a rejoin the member resumes from its committed offset, so the
+    /// records after it arrive again. Counting those as duplicates would make
+    /// every broker restart look like a broken producer.
     #[test]
-    fn a_replay_after_a_reconnect_is_not_a_duplicate() {
+    fn a_replay_after_a_rejoin_is_not_a_duplicate() {
         let mut watch = watch();
         for sequence in 1..=5 {
             watch.check_sequence(&record(sequence as i64, ""), &beat("run-a", sequence));
         }
-        watch.reconnecting(&anyhow::anyhow!("connection reset"));
+        watch.rejoining(&anyhow::anyhow!("connection reset"));
         watch.check_sequence(&record(4, ""), &beat("run-a", 4));
         watch.check_sequence(&record(5, ""), &beat("run-a", 5));
         watch.check_sequence(&record(6, ""), &beat("run-a", 6));
@@ -1029,6 +1083,27 @@ mod tests {
         // ...and the window closes behind it, so a real duplicate still counts.
         watch.check_sequence(&record(7, ""), &beat("run-a", 6));
         assert_eq!(watch.tally.duplicates, 1);
+    }
+
+    /// A rebalance resumes gained partitions from their committed offsets, so
+    /// it opens the same replay window a rejoin does — and is not itself a
+    /// fault.
+    #[test]
+    fn a_replay_after_a_rebalance_is_not_a_duplicate() {
+        let mut watch = watch();
+        for sequence in 1..=5 {
+            watch.check_sequence(&record(sequence as i64, ""), &beat("run-a", sequence));
+        }
+        watch.rebalanced(
+            &[("kaas-canary".to_owned(), 0)],
+            &[("kaas-canary".to_owned(), 0), ("kaas-canary".to_owned(), 1)],
+        );
+        watch.check_sequence(&record(4, ""), &beat("run-a", 4));
+        watch.check_sequence(&record(5, ""), &beat("run-a", 5));
+        assert_eq!(watch.tally.duplicates, 0);
+        assert_eq!(watch.tally.replayed, 2);
+        assert_eq!(watch.tally.rebalances, 1);
+        assert_eq!(watch.tally.faults(), 0, "a rebalance is not a finding");
     }
 
     /// A restart is a new run_id, and the old run's sequence has nothing to do
@@ -1153,9 +1228,10 @@ mod tests {
         assert_eq!(watch.tally.mislabelled, 0);
     }
 
-    /// Reading a day of retained heartbeats means reading a day of old
-    /// timestamps. Reporting each one as late is a warning per record for the
-    /// whole replay, which is how a canary teaches people to ignore its log.
+    /// Joining a group with no committed offset starts at the earliest retained
+    /// record, so the first run reads a day of old timestamps. Reporting each
+    /// one as late is a warning per record for the whole replay, which is how a
+    /// canary teaches people to ignore its log.
     #[test]
     fn a_replay_is_not_reported_as_late() {
         let mut watch = watch();
