@@ -165,8 +165,12 @@ struct Args {
     /// Without one, every restart is a rebalance. With one, a restart inside
     /// the session timeout keeps the same assignment — which for a canary is
     /// the difference between a deploy showing up as a gap in coverage and not
-    /// showing up at all. Set it to something stable per replica; the pod name
-    /// is the obvious choice.
+    /// showing up at all.
+    ///
+    /// A literal, not the pod name: a Deployment regenerates pod names per
+    /// ReplicaSet, so an id derived from one never survives the restart it
+    /// exists to cover. One replica per cluster makes a fixed string both
+    /// stable and unique.
     #[arg(long, env = "KAAS_CANARY_INSTANCE_ID")]
     instance_id: Option<String>,
 

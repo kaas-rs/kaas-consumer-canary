@@ -173,8 +173,12 @@ interval by construction rather than by review.
 `--instance-id` is worth setting for a deployed replica. Without it every
 restart triggers a rebalance; with it, a restart inside the session timeout
 keeps the same assignment, which is the difference between a deploy showing up
-as a gap in coverage and not showing up at all. The pod name is the obvious
-value.
+as a gap in coverage and not showing up at all.
+
+Use a literal, not the pod name. A Deployment regenerates pod names per
+ReplicaSet, so an id derived from one never survives the restart it exists to
+cover. With a single replica per cluster a fixed string is both stable and
+unique, which is all KIP-345 asks for.
 
 `--strict` turns `--count` into an acceptance check. It fails on loss,
 duplication, silence, unparseable payloads and mislabelled records — not on
