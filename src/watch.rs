@@ -17,6 +17,7 @@ use kafka_read::TimestampType;
 use tokio::time::Instant;
 
 use crate::heartbeat::Heartbeat;
+use crate::registry::DecodeError;
 
 /// A sequence this far ahead of the last one is not a hole worth remembering.
 ///
@@ -203,28 +204,46 @@ impl Watch {
         self.backlog_worst_ms = 0;
     }
 
-    pub fn observe_record(&mut self, record: &Record) {
-        let Some(value) = &record.value else {
-            // A tombstone here is a record with a null value on a topic that
-            // only ever carries heartbeats, so somebody else is writing.
-            self.tally.unparseable += 1;
-            tracing::error!(
-                partition = record.partition,
-                offset = record.offset,
-                "a record on this topic has no value"
-            );
-            return;
-        };
-
-        let beat: Heartbeat = match serde_json::from_slice(value) {
+    /// One record, and what [`crate::registry`] made of its value.
+    ///
+    /// The decode arrives as a parameter rather than happening here because
+    /// resolving a schema id is an async registry lookup, and this module is
+    /// the half of the canary that has to stay testable without a broker — or
+    /// now, without a registry either. What is left here is the part that has
+    /// always belonged: what the record *means* for the stream.
+    pub fn observe_record(&mut self, record: &Record, decoded: Result<Heartbeat, DecodeError>) {
+        let beat = match decoded {
             Ok(beat) => beat,
-            Err(error) => {
+            // A null value on a topic that only ever carries heartbeats, so
+            // somebody else is writing. Its own arm because "no value" and
+            // "not a heartbeat" send an operator to different places.
+            Err(DecodeError::Tombstone) => {
                 self.tally.unparseable += 1;
                 tracing::error!(
                     partition = record.partition,
                     offset = record.offset,
+                    "a record on this topic has no value"
+                );
+                return;
+            }
+            Err(error) => {
+                self.tally.unparseable += 1;
+                // Lossy UTF-8 of an Avro datum is mostly unreadable, and it is
+                // still the right thing to print: the first bytes show the
+                // magic byte and schema id, which is what says whether this is
+                // a differently-framed record or a differently-shaped one.
+                let preview = record
+                    .value
+                    .as_ref()
+                    .map(|value| {
+                        String::from_utf8_lossy(&value[..value.len().min(120)]).into_owned()
+                    })
+                    .unwrap_or_default();
+                tracing::error!(
+                    partition = record.partition,
+                    offset = record.offset,
                     %error,
-                    preview = %String::from_utf8_lossy(&value[..value.len().min(120)]),
+                    preview = %preview,
                     "a record on this topic is not a heartbeat"
                 );
                 return;
@@ -803,9 +822,37 @@ mod tests {
     #[test]
     fn a_record_that_is_not_a_heartbeat_is_a_finding() {
         let mut watch = watch();
-        watch.observe_record(&record(1, "not json"));
+        // A real decode failure rather than a hand-built one: apache-avro's
+        // Error has no public variants, and resolving a bare Long into a record
+        // is the shape a retyped field would actually take.
+        let failure = apache_avro::from_value::<Heartbeat>(&apache_avro::types::Value::Long(1))
+            .unwrap_err();
+        watch.observe_record(&record(1, "not an avro datum"), Err(DecodeError::Body(failure)));
         assert_eq!(watch.tally.unparseable, 1);
         assert_eq!(watch.tally.heartbeats, 0);
+    }
+
+    /// A null value is counted with the unparseable ones but reported
+    /// differently — somebody else writing to the topic is a different problem
+    /// from the producer writing something unexpected.
+    #[test]
+    fn a_record_with_no_value_is_a_finding_too() {
+        let mut watch = watch();
+        let mut empty = record(1, "");
+        empty.value = None;
+        watch.observe_record(&empty, Err(DecodeError::Tombstone));
+        assert_eq!(watch.tally.unparseable, 1);
+        assert_eq!(watch.tally.heartbeats, 0);
+    }
+
+    /// The path that had stopped working: a decoded heartbeat must be counted
+    /// as one and checked, not merely not-rejected.
+    #[test]
+    fn a_decoded_heartbeat_is_counted_and_checked() {
+        let mut watch = watch();
+        watch.observe_record(&record(1, ""), Ok(beat("run-a", 1)));
+        assert_eq!(watch.tally.heartbeats, 1);
+        assert_eq!(watch.tally.unparseable, 0);
     }
 
     /// The producer sets the record timestamp and the body timestamp from one

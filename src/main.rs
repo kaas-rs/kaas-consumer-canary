@@ -82,6 +82,7 @@
 //! * [`token`] — the EntraID token exchange behind it, and why that lives in
 //!   this crate rather than in kaas-lib.
 //! * [`heartbeat`] — the payload, which is a contract with the other repo.
+//! * [`registry`] — resolving a record's schema by the id it carries.
 //! * [`watch`] — the model of the stream and every check against it. Knows
 //!   nothing about Kafka beyond the shape of a record, which is what makes it
 //!   testable without a broker.
@@ -98,6 +99,7 @@ mod cli;
 mod heartbeat;
 mod identity;
 mod reader;
+mod registry;
 mod token;
 mod watch;
 
@@ -108,6 +110,7 @@ use kafka_consume::ClusterConfig;
 
 use crate::cli::Args;
 use crate::identity::WorkloadIdentity;
+use crate::registry::Decoder;
 use crate::watch::Watch;
 
 #[tokio::main]
@@ -116,11 +119,16 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let bootstrap = args.bootstrap_servers()?;
+    let registry_url = args.schema_registry_url()?;
     let session = args.session();
     // Before the first connection, so a half-set identity is reported as the
     // variable that is missing rather than as a handshake that failed — and
     // reported once, rather than once per rejoin for the life of the process.
     let identity = WorkloadIdentity::from_env()?;
+    // Built before the connection and fatal if the URL is malformed, beside the
+    // other boundary checks. It reaches nothing yet — the first fetch is the
+    // first record carrying an unseen schema id.
+    let decoder = Decoder::new(registry_url)?;
     let mut watch = Watch::new(args.thresholds());
 
     // Built once and shared by every rejoin: the SASL config holds its token
@@ -160,7 +168,7 @@ async fn main() -> Result<()> {
     // Scoped so the borrow of `watch` ends with the future, leaving the summary
     // below reachable whether the watch returned or ctrl-c cancelled it.
     {
-        let watching = reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config);
+        let watching = reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config, &decoder);
         tokio::pin!(watching);
         tokio::select! {
             result = &mut watching => result?,

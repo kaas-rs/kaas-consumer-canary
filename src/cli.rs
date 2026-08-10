@@ -31,6 +31,18 @@ pub struct Args {
     #[arg(long, env = "KAAS_CANARY_TOPIC", default_value = "kaas-canary")]
     pub topic: String,
 
+    /// Base URL of the Confluent-compatible schema registry.
+    ///
+    /// Required, and without a default on purpose — the same reasoning the
+    /// producer gives for its own copy of this flag. Every record is Avro
+    /// framed with a schema id, so a reader without a registry cannot resolve a
+    /// single one; starting anyway would mean counting the entire stream as
+    /// unparseable, which is indistinguishable from the producer having broken.
+    ///
+    /// Apicurio serves this API under `/apis/ccompat/v7`.
+    #[arg(long, env = "KAAS_CANARY_SCHEMA_REGISTRY")]
+    pub schema_registry: String,
+
     /// The consumer group to join.
     ///
     /// Committed offsets live under this name, so it decides what a restart
@@ -160,6 +172,28 @@ impl Args {
         )
     }
 
+    /// The registry URL, checked for the one thing this build cannot do.
+    ///
+    /// `schema_registry_converter` is compiled without a TLS backend here —
+    /// `Cargo.toml` says why, and it is a decision about the release image
+    /// rather than about the registry. The consequence is that an `https://`
+    /// URL fails inside reqwest, at the first record, with a message about URL
+    /// schemes. Catching it at the boundary means the error names the flag that
+    /// was wrong instead.
+    pub fn schema_registry_url(&self) -> Result<&str> {
+        let url = self.schema_registry.trim();
+        if url.is_empty() {
+            anyhow::bail!("--schema-registry is empty");
+        }
+        if !url.starts_with("http://") {
+            anyhow::bail!(
+                "--schema-registry must be an http:// URL, got {url:?} — \
+                 this build has no TLS backend, see Cargo.toml"
+            );
+        }
+        Ok(url)
+    }
+
     /// What to trust for the Kafka connection.
     ///
     /// Read here rather than inside the connection so that an unreadable bundle
@@ -191,5 +225,38 @@ impl Args {
             .with_maybe_count(self.count)
             .with_summary_every(Duration::from_secs(self.summary_secs))
             .with_commit_every(Duration::from_secs(self.commit_secs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(registry: &str) -> Args {
+        Args::parse_from([
+            "kaas-consumer-canary",
+            "--bootstrap",
+            "broker:9092",
+            "--schema-registry",
+            registry,
+        ])
+    }
+
+    /// The boundary the `registry` module deliberately does not have. `SrSettings`
+    /// accepts any string and makes no request, so without this check a typo
+    /// surfaces per-record, as a message about URL schemes rather than about the
+    /// flag that was wrong.
+    #[test]
+    fn the_registry_url_is_checked_here_because_nothing_downstream_checks_it() {
+        assert!(args("http://apicurio:8080/apis/ccompat/v7")
+            .schema_registry_url()
+            .is_ok());
+
+        // https is not a typo but is still unusable: this build has no TLS
+        // backend for the registry client. Rejecting it names the reason.
+        let err = format!("{}", args("https://apicurio:8080").schema_registry_url().unwrap_err());
+        assert!(err.contains("no TLS backend"), "{err}");
+
+        assert!(args("   ").schema_registry_url().is_err());
     }
 }

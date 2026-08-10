@@ -155,6 +155,7 @@ Two things suppress it rather than report it:
 |---|---|---|---|
 | `--bootstrap` | `KAAS_CANARY_BOOTSTRAP` | — | comma-separated `host:port` |
 | `--topic` | `KAAS_CANARY_TOPIC` | `kaas-canary` | |
+| `--schema-registry` | `KAAS_CANARY_SCHEMA_REGISTRY` | — | ccompat base URL; `http://` only |
 | `--group` | `KAAS_CANARY_GROUP` | `kaas-consumer-canary` | where committed offsets live |
 | `--instance-id` | `KAAS_CANARY_INSTANCE_ID` | — | static membership; a restart is not a rebalance |
 | `--interval-ms` | `KAAS_CANARY_INTERVAL_MS` | `1000` | what the producer is writing at |
@@ -168,8 +169,32 @@ Two things suppress it rather than report it:
 | `--ca-file` | `KAAS_CANARY_CA_FILE` | system roots | PEM bundle to trust for the Kafka connection |
 
 The shared environment variables are the producer's, on purpose: a producer and
-its reader configured from one environment agree about the topic and the
-interval by construction rather than by review.
+its reader configured from one environment agree about the topic, the interval
+and the registry by construction rather than by review.
+
+`--schema-registry` has no default and is required, for the same reason it is on
+the producer: every record is Avro framed with a schema id, so a reader without a
+registry cannot resolve a single one. Starting anyway would mean counting the
+whole stream as unparseable — which looks exactly like the producer having
+broken, and is the failure this crate spent a while actually having.
+
+## The payload is Avro, and the schema comes off the wire
+
+Records carry Confluent framing: a zero magic byte, the schema id as four
+big-endian bytes, then the datum. The id is the point. It names the schema the
+record was *written* with, which is not necessarily the one this crate was
+compiled against, and Avro resolution needs the writer's schema to bridge them.
+
+So the reader fetches by id and caches — the registry is reached once per
+distinct id, in practice once per process, and can be down for the rest of the
+run without costing a record. Decoding against a schema hardcoded here would
+work right up until the producer added a field, and then fail on every record.
+
+There is a copy of the schema in [`src/heartbeat.rs`](src/heartbeat.rs), and it
+is `#[cfg(test)]`. Nothing on the read path consults it; it exists so the struct
+in this repository can be checked against the contract at test time, in the
+repository that depends on it. A renamed field on the producer's side should be
+a failing test here, not a production outage.
 
 `--instance-id` is worth setting for a deployed replica. Without it every
 restart triggers a rebalance; with it, a restart inside the session timeout

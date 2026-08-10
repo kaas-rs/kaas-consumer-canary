@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use kafka_consume::{Cluster, ClusterConfig, ConsumerConfig, GroupConsumer};
 use tokio::time::Instant;
 
+use crate::registry::Decoder;
 use crate::watch::Watch;
 
 /// How the reader reads.
@@ -146,6 +147,7 @@ pub async fn watch_topic(
     session: &Session,
     watch: &mut Watch,
     cluster_config: &ClusterConfig,
+    decoder: &Decoder,
 ) -> Result<()> {
     let mut backoff = Backoff::new();
     loop {
@@ -162,7 +164,7 @@ pub async fn watch_topic(
         // storm at the issuer, which is the way to get rate-limited by EntraID
         // precisely when the cluster is already unhappy.
         let outcome = match Cluster::connect(bootstrap.to_vec(), cluster_config.clone()).await {
-            Ok(cluster) => read_session(cluster, session, watch, &mut progressed).await,
+            Ok(cluster) => read_session(cluster, session, watch, decoder, &mut progressed).await,
             Err(error) => Err(anyhow::Error::new(error).context("connecting to the cluster")),
         };
 
@@ -192,6 +194,7 @@ async fn read_session(
     cluster: Cluster,
     session: &Session,
     watch: &mut Watch,
+    decoder: &Decoder,
     progressed: &mut bool,
 ) -> Result<()> {
     let mut consumer = GroupConsumer::subscribe(
@@ -240,7 +243,12 @@ async fn read_session(
                 }
 
                 for record in &records {
-                    watch.observe_record(record);
+                    // Awaited per record, and cheap after the first: the
+                    // decoder caches resolved schemas by id, so this reaches
+                    // the registry once per distinct id — in practice once per
+                    // process — and is a map lookup thereafter.
+                    let decoded = decoder.decode(record.value.as_deref()).await;
+                    watch.observe_record(record, decoded);
                     if let Some(limit) = session.count
                         && watch.tally().heartbeats >= limit
                     {

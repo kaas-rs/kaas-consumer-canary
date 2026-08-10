@@ -1,7 +1,7 @@
 [package]
 name        = "kaas-consumer-canary"
 description = "Reads kaas-producer-canary's heartbeats and reports what is wrong with them, using kaas-lib."
-version     = "0.2.0"
+version     = "0.3.0"
 edition     = "2024"
 license     = "Apache-2.0"
 publish     = false
@@ -68,6 +68,27 @@ rustls              = { version = "0.23", default-features = false, features = [
     "logging",
 ] }
 rustls-native-certs = "0.8"
+
+# Avro, and the Confluent wire format around it.
+#
+# The producer's payload stopped being JSON at its 0.3.0, and this crate did not
+# follow — it went on calling `serde_json::from_slice` on an Avro datum and
+# counting every heartbeat as unparseable. A monitor that rejects the whole
+# stream reports nothing about it, so this is the half of the pair that had
+# quietly stopped working.
+#
+# No TLS feature, the same deliberate exclusion the producer documents: both of
+# the crate's options reach for a C project (OpenSSL, or `aws-lc-sys` and
+# cmake), either of which costs the release image its "static musl, one build
+# package" property and puts a second crypto provider into the same `rustls`
+# used above for the Kafka connection. `--schema-registry` therefore takes
+# `http://` only, which in-cluster is the whole requirement.
+#
+# `apache-avro` is direct because decoding resolves a datum into `Heartbeat`,
+# and its version must track whatever `schema_registry_converter` resolves — the
+# `Value` handed to `from_value` is that crate's type, not ours.
+schema_registry_converter = { version = "4.10", default-features = false, features = ["avro", "futures"] }
+apache-avro = "0.21"
 
 tokio  = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time"] }
 clap   = { version = "4.5", features = ["derive", "env"] }
