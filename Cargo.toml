@@ -1,7 +1,7 @@
 [package]
 name        = "kaas-consumer-canary"
 description = "Reads kaas-producer-canary's heartbeats and reports what is wrong with them, using kaas-lib."
-version     = "0.1.1"
+version     = "0.2.0"
 edition     = "2024"
 license     = "Apache-2.0"
 publish     = false
@@ -20,12 +20,54 @@ publish     = false
 # coordinator, the KIP-848 heartbeat and offset commits as well as the fetch
 # path, which is the larger and newer surface, and it is the half of the read
 # path nothing else here was testing.
-kafka-consume = "0.4"
+kafka-consume = "0.7"
 # Only for `TimestampType` — the type of a field on the `Record` that
 # `kafka-consume` re-exports without re-exporting the enum needed to match on
 # it. Not a second read path: `kafka-consume` is built on this crate's decoder
 # and both resolve to one version. The day that re-export lands, this line goes.
-kafka-read = "0.4"
+kafka-read = "0.7"
+# TLS, SASL and the `TokenProvider` trait, for the workload identity in
+# `identity.rs`. Deliberately without the `oidc` feature: that is a
+# `client_credentials` exchange with a client secret, and the federated exchange
+# that replaces it is this crate's business rather than the library's — see the
+# header of `token.rs`. Not a new dependency in any real sense, since it already
+# sits in the tree underneath `kafka-consume`.
+kafka-conn = "0.7"
+
+# The token exchange in `token.rs`, and nothing else. Pinned to match kaas-lib's
+# own workspace pins exactly, which is what makes it safe to add: `hyper-rustls`
+# with `default-features = false, features = ["ring"]` brings no second crypto
+# provider, so `default_provider()` still resolves to ring for the Kafka
+# connection this canary exists to watch, and nothing here needs cmake or a C
+# toolchain. The image stays a static musl build whose only build package is
+# `musl-dev`.
+#
+# `azure_identity` implements this exchange and is maintained by the people who
+# own the protocol, which would make it the right dependency in most programs.
+# Not here: it resolves to 194 additional packages including `aws-lc-rs` and
+# `aws-lc-sys`, which is both the C toolchain this image refuses and a second
+# provider in the same `rustls`.
+hyper           = { version = "1.8", features = ["client", "http1"] }
+hyper-util      = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls    = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "tls12",
+    "logging",
+] }
+http-body-util  = "0.1"
+form_urlencoded = "1.2"
+bytes           = "1.12"
+# `ring` named explicitly when the client config is built rather than left to
+# `rustls`'s process-wide default provider, which is global mutable state any
+# dependency can install first.
+rustls              = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-native-certs = "0.8"
 
 tokio  = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time"] }
 clap   = { version = "4.5", features = ["derive", "env"] }
@@ -37,10 +79,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# `bytes` to build a `Record` by hand, and tokio's clock so the tests that turn
-# on elapsed time — a reorder window closing, a run going silent — assert on it
-# instead of sleeping through it.
-bytes = "1"
+# tokio's clock, so the tests that turn on elapsed time — a reorder window
+# closing, a run going silent — assert on it instead of sleeping through it.
+# `bytes` used to be here too, for building a `Record` by hand; it is a real
+# dependency now that `token.rs` needs it, so the tests take it from there.
 tokio = { version = "1.53", features = ["test-util"] }
 
 [lints.clippy]

@@ -165,6 +165,7 @@ Two things suppress it rather than report it:
 | `--commit-secs` | | `10` | `0` to never commit |
 | `--count` | | — | stop after N heartbeats; runs forever when unset |
 | `--strict` | | off | exit non-zero if anything was found |
+| `--ca-file` | `KAAS_CANARY_CA_FILE` | system roots | PEM bundle to trust for the Kafka connection |
 
 The shared environment variables are the producer's, on purpose: a producer and
 its reader configured from one environment agree about the topic and the
@@ -194,6 +195,49 @@ kaas-consumer-canary --bootstrap kafka:9092 --count 500 --strict
 # starts from the beginning rather than from a committed offset.
 kaas-consumer-canary --bootstrap kafka:9092 --group audit-$(date +%s) --strict
 ```
+
+## Workload identity
+
+There are no flags for it. If the environment describes a federated identity,
+this canary authenticates with SASL/OAUTHBEARER; if it does not, it connects the
+way it always has. Nothing in between has to be configured:
+
+| variable | | |
+|---|---|---|
+| `AZURE_CLIENT_ID` | required | the **application (client) id** — not the service principal's object id |
+| `AZURE_TENANT_ID` | required | selects the issuer |
+| `AZURE_FEDERATED_TOKEN_FILE` | required | path to the assertion, re-read on every token fetch |
+| `AZURE_AUTHORITY_HOST` | `https://login.microsoftonline.com/` | for sovereign clouds |
+| `AZURE_KAFKA_SCOPE` | `api://<client-id>/.default` | when the broker wants a token about some other resource |
+
+The first three are exactly what AKS's `azure-wi-webhook` injects, so a pod that
+runs here runs on AKS unchanged. **Setting some but not all three is an error at
+startup**, not a quiet fall back to anonymous — a canary that silently connects
+to a listener nobody meant to test reports on the wrong thing for as long as
+nobody notices, which is this process's worst failure mode.
+
+Two things follow automatically from an identity being present:
+
+- **TLS is turned on**, with no way to opt out. OAUTHBEARER over a plaintext
+  listener puts an access token on the wire in the clear, and unlike a password
+  a stolen bearer token is honoured from whoever replays it until it expires.
+- **`--ca-file` is usually needed with it.** Strimzi signs its listeners with a
+  per-cluster CA that is in no system trust store; without the flag the
+  handshake fails at connect — and here it fails once per backoff tick, forever,
+  which is why the bundle is read and rejected at startup instead.
+
+The token provider is built once and shared by every rejoin. That matters more
+here than in the producer: this process drops its cluster handle and rebuilds it
+on every lost session, and a config rebuilt alongside it would mean a fresh
+token fetch per backoff tick — turning a rejoin storm into a request storm at
+the issuer, at exactly the moment the cluster is already unhappy.
+
+The exchange itself is [`src/token.rs`](src/token.rs), in this crate rather than
+in kaas-lib, which stops at `TokenProvider` — "give me a bearer token, and a
+fresh one when I ask again". An `AADSTS` error taxonomy is not something a Kafka
+client library should carry for every one of its consumers. That module's header
+records why the official `azure_identity` crate is not the dependency here,
+which is a fact about this image rather than about the crate.
 
 ## Failure policy
 

@@ -137,7 +137,16 @@ impl Backoff {
 /// backoff, and it means there is no cached routing state that can outlive the
 /// failure that ended the session — a canary wedged onto a stale coordinator is
 /// a canary reporting silence about a healthy cluster.
-pub async fn watch_topic(bootstrap: &[String], session: &Session, watch: &mut Watch) -> Result<()> {
+///
+/// `cluster_config` carries the TLS and SASL settings and is deliberately built
+/// once by the caller rather than defaulted here, so that the token provider it
+/// holds outlives any individual session.
+pub async fn watch_topic(
+    bootstrap: &[String],
+    session: &Session,
+    watch: &mut Watch,
+    cluster_config: &ClusterConfig,
+) -> Result<()> {
     let mut backoff = Backoff::new();
     loop {
         // Whether this attempt got as far as a successful poll. Connecting is
@@ -145,7 +154,14 @@ pub async fn watch_topic(bootstrap: &[String], session: &Session, watch: &mut Wa
         // broker reachable and answering.
         let mut progressed = false;
 
-        let outcome = match Cluster::connect(bootstrap.to_vec(), ClusterConfig::default()).await {
+        // Cloned per attempt because the handle is dropped with the member, but
+        // the clone is shallow where it matters: a SASL config holds its token
+        // provider behind an `Arc`, so every rejoin shares one token and one
+        // cache. Rebuilding the config here instead would mean a fresh token
+        // fetch on every backoff tick — a rejoin storm turned into a request
+        // storm at the issuer, which is the way to get rate-limited by EntraID
+        // precisely when the cluster is already unhappy.
+        let outcome = match Cluster::connect(bootstrap.to_vec(), cluster_config.clone()).await {
             Ok(cluster) => read_session(cluster, session, watch, &mut progressed).await,
             Err(error) => Err(anyhow::Error::new(error).context("connecting to the cluster")),
         };

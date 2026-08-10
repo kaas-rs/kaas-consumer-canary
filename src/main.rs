@@ -77,6 +77,10 @@
 //! # Layout
 //!
 //! * [`cli`] — the command line, and the conversions out of it.
+//! * [`identity`] — workload identity, read from the environment rather than
+//!   asked for, and why it is the one thing here with no flag.
+//! * [`token`] — the EntraID token exchange behind it, and why that lives in
+//!   this crate rather than in kaas-lib.
 //! * [`heartbeat`] — the payload, which is a contract with the other repo.
 //! * [`watch`] — the model of the stream and every check against it. Knows
 //!   nothing about Kafka beyond the shape of a record, which is what makes it
@@ -92,13 +96,18 @@
 
 mod cli;
 mod heartbeat;
+mod identity;
 mod reader;
+mod token;
 mod watch;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kafka_conn::ConnectionConfig;
+use kafka_consume::ClusterConfig;
 
 use crate::cli::Args;
+use crate::identity::WorkloadIdentity;
 use crate::watch::Watch;
 
 #[tokio::main]
@@ -108,7 +117,26 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let bootstrap = args.bootstrap_servers()?;
     let session = args.session();
+    // Before the first connection, so a half-set identity is reported as the
+    // variable that is missing rather than as a handshake that failed — and
+    // reported once, rather than once per rejoin for the life of the process.
+    let identity = WorkloadIdentity::from_env()?;
     let mut watch = Watch::new(args.thresholds());
+
+    // Built once and shared by every rejoin: the SASL config holds its token
+    // provider behind an `Arc`, so the token cache outlives any one session.
+    let mut cluster_config = ClusterConfig::default();
+    if let Some(identity) = &identity {
+        // TLS is not optional once there is a bearer token to send. OAUTHBEARER
+        // over a plaintext listener puts an access token on the wire in the
+        // clear, and unlike a password it is honoured from whoever replays it
+        // until it expires. The presence of an identity decides the transport
+        // too, so there is no flag to get this wrong with.
+        cluster_config.connection = ConnectionConfig::new()
+            .with_tls(args.tls_config()?)
+            .with_sasl(identity.sasl()?);
+        tracing::info!(identity = %identity.describe(), "workload identity detected");
+    }
 
     let thresholds = watch.thresholds();
     tracing::info!(
@@ -118,13 +146,21 @@ async fn main() -> Result<()> {
         interval_ms = args.interval_ms,
         stall_ms = thresholds.stall.as_millis(),
         reorder_ms = thresholds.reorder.as_millis(),
+        // Worth a field of its own: "which listener did this actually reach" is
+        // the first question about any gap in the findings, and the answer is
+        // not recoverable from the bootstrap address alone.
+        auth = if identity.is_some() {
+            "oauthbearer"
+        } else {
+            "none"
+        },
         "canary starting"
     );
 
     // Scoped so the borrow of `watch` ends with the future, leaving the summary
     // below reachable whether the watch returned or ctrl-c cancelled it.
     {
-        let watching = reader::watch_topic(&bootstrap, &session, &mut watch);
+        let watching = reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config);
         tokio::pin!(watching);
         tokio::select! {
             result = &mut watching => result?,
