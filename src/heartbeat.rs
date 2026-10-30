@@ -169,7 +169,10 @@ mod tests {
         .unwrap();
 
         let value = apache_avro::types::Value::Record(vec![
-            ("run_id".into(), apache_avro::types::Value::String("abc-1".into())),
+            (
+                "run_id".into(),
+                apache_avro::types::Value::String("abc-1".into()),
+            ),
             ("sequence".into(), apache_avro::types::Value::Long(7)),
             (
                 "timestamp_ms".into(),
@@ -179,7 +182,10 @@ mod tests {
                 "timestamp".into(),
                 apache_avro::types::Value::String("2026-08-02T16:04:34.238Z".into()),
             ),
-            ("host".into(), apache_avro::types::Value::String("canary-0".into())),
+            (
+                "host".into(),
+                apache_avro::types::Value::String("canary-0".into()),
+            ),
             (
                 "region".into(),
                 apache_avro::types::Value::String("eu-west".into()),

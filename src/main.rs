@@ -126,9 +126,20 @@ async fn main() -> Result<()> {
     // reported once, rather than once per rejoin for the life of the process.
     let identity = WorkloadIdentity::from_env()?;
     // Built before the connection and fatal if the URL is malformed, beside the
-    // other boundary checks. It reaches nothing yet — the first fetch is the
-    // first record carrying an unseen schema id.
-    let decoder = Decoder::new(registry_url)?;
+    // other boundary checks. It reaches no registry yet — the first fetch is
+    // the first record carrying an unseen schema id — but with a registry scope
+    // it does fetch its first token, so a scope the issuer refuses is reported
+    // here, once, rather than as every record being unparseable.
+    let registry_tokens = match &identity {
+        Some(identity) => identity.registry_tokens()?,
+        None => None,
+    };
+    let registry_auth = if registry_tokens.is_some() {
+        "oauthbearer"
+    } else {
+        "none"
+    };
+    let decoder = Decoder::new(registry_url, registry_tokens).await?;
     let mut watch = Watch::new(args.thresholds());
 
     // Built once and shared by every rejoin: the SASL config holds its token
@@ -162,13 +173,17 @@ async fn main() -> Result<()> {
         } else {
             "none"
         },
+        // The same question about the registry: a 401 from one that started
+        // enforcing shows up as unparseable records, and this rules it in or out.
+        registry_auth,
         "canary starting"
     );
 
     // Scoped so the borrow of `watch` ends with the future, leaving the summary
     // below reachable whether the watch returned or ctrl-c cancelled it.
     {
-        let watching = reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config, &decoder);
+        let watching =
+            reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config, &decoder);
         tokio::pin!(watching);
         tokio::select! {
             result = &mut watching => result?,

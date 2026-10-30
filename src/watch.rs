@@ -825,9 +825,12 @@ mod tests {
         // A real decode failure rather than a hand-built one: apache-avro's
         // Error has no public variants, and resolving a bare Long into a record
         // is the shape a retyped field would actually take.
-        let failure = apache_avro::from_value::<Heartbeat>(&apache_avro::types::Value::Long(1))
-            .unwrap_err();
-        watch.observe_record(&record(1, "not an avro datum"), Err(DecodeError::Body(failure)));
+        let failure =
+            apache_avro::from_value::<Heartbeat>(&apache_avro::types::Value::Long(1)).unwrap_err();
+        watch.observe_record(
+            &record(1, "not an avro datum"),
+            Err(DecodeError::Body(failure)),
+        );
         assert_eq!(watch.tally.unparseable, 1);
         assert_eq!(watch.tally.heartbeats, 0);
     }

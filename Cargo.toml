@@ -90,7 +90,9 @@ rustls-native-certs = "0.8"
 schema_registry_converter = { version = "4.10", default-features = false, features = ["avro", "futures"] }
 apache-avro = "0.21"
 
-tokio  = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time"] }
+# `sync` for the token cache and the decoder's lock. It used to arrive only
+# through kaas-lib's own tokio features, which is not a dependency to lean on.
+tokio  = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 clap   = { version = "4.5", features = ["derive", "env"] }
 serde  = { version = "1", features = ["derive"] }
 serde_json = "1"

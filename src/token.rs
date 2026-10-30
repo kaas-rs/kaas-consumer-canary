@@ -157,9 +157,11 @@ impl FederatedTokenProvider {
         scope: impl Into<String>,
         assertion_file: impl Into<PathBuf>,
     ) -> Result<Self> {
-        let endpoint: Uri = endpoint
-            .parse()
-            .map_err(|e| auth(format!("token endpoint {endpoint:?} is not a valid uri: {e}")))?;
+        let endpoint: Uri = endpoint.parse().map_err(|e| {
+            auth(format!(
+                "token endpoint {endpoint:?} is not a valid uri: {e}"
+            ))
+        })?;
         // No plaintext escape hatch, unlike kaas-lib's general-purpose OIDC
         // provider. This one only ever talks to EntraID, which is https, and an
         // assertion on a plaintext wire is a bearer credential handed to
@@ -225,7 +227,12 @@ impl FederatedTokenProvider {
 
         let response = tokio::time::timeout(FETCH_TIMEOUT, self.http.request(request))
             .await
-            .map_err(|_| auth(format!("no response from {} within {FETCH_TIMEOUT:?}", self.endpoint)))?
+            .map_err(|_| {
+                auth(format!(
+                    "no response from {} within {FETCH_TIMEOUT:?}",
+                    self.endpoint
+                ))
+            })?
             .map_err(|e| auth(format!("reaching {}: {e}", self.endpoint)))?;
 
         let status = response.status();
@@ -390,7 +397,10 @@ mod tests {
     #[test]
     fn an_unreadable_assertion_fails_before_a_request_goes_out() {
         let err = provider().form_body().unwrap_err();
-        assert!(format!("{err}").contains("/nonexistent/azure-token"), "{err}");
+        assert!(
+            format!("{err}").contains("/nonexistent/azure-token"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -412,7 +422,10 @@ mod tests {
 
         assert!(body.contains("grant_type=client_credentials"), "{body}");
         assert!(body.contains("client_id=app-id"), "{body}");
-        assert!(body.contains("client_assertion=header.payload.signature"), "{body}");
+        assert!(
+            body.contains("client_assertion=header.payload.signature"),
+            "{body}"
+        );
         assert!(
             body.contains("client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3A"),
             "{body}"
@@ -436,6 +449,9 @@ mod tests {
         );
         // Absurdly short: the floor wins, so this cannot become a fetch per
         // SASL exchange.
-        assert_eq!(refresh_interval(Duration::from_secs(1)), MIN_REFRESH_INTERVAL);
+        assert_eq!(
+            refresh_interval(Duration::from_secs(1)),
+            MIN_REFRESH_INTERVAL
+        );
     }
 }
