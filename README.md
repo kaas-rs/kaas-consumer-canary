@@ -234,12 +234,25 @@ way it always has. Nothing in between has to be configured:
 | `AZURE_FEDERATED_TOKEN_FILE` | required | path to the assertion, re-read on every token fetch |
 | `AZURE_AUTHORITY_HOST` | `https://login.microsoftonline.com/` | for sovereign clouds |
 | `AZURE_KAFKA_SCOPE` | `api://<client-id>/.default` | when the broker wants a token about some other resource |
+| `AZURE_SCHEMA_REGISTRY_SCOPE` | unset: anonymous | when the schema registry requires a token: its app registration's scope, e.g. `<registry client id>/.default` |
 
 The first three are exactly what AKS's `azure-wi-webhook` injects, so a pod that
 runs here runs on AKS unchanged. **Setting some but not all three is an error at
 startup**, not a quiet fall back to anonymous — a canary that silently connects
 to a listener nobody meant to test reports on the wrong thing for as long as
 nobody notices, which is this process's worst failure mode.
+
+The registry scope has no default, because a registry that enforces
+authentication wants a token about *its own* app registration and nothing in the
+environment says which that is. With it set, every schema fetch carries
+`Authorization: Bearer`; the first token is fetched at startup, so a scope the
+issuer refuses stops the process rather than turning every record into an
+`unparseable` one, and later tokens are refreshed for as long as the canary runs
+— a new schema id can arrive at any time. Unset, the registry is called
+anonymously, as before. **Setting it without the identity is an error at
+startup.** The token goes over the registry's `http://` URL in the clear; its
+audience is the registry alone and it expires within the hour, but TLS on the
+registry is the real fix.
 
 Two things follow automatically from an identity being present:
 
