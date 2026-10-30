@@ -168,7 +168,8 @@ async fn main() -> Result<()> {
     // Scoped so the borrow of `watch` ends with the future, leaving the summary
     // below reachable whether the watch returned or ctrl-c cancelled it.
     {
-        let watching = reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config, &decoder);
+        let watching =
+            reader::watch_topic(&bootstrap, &session, &mut watch, &cluster_config, &decoder);
         tokio::pin!(watching);
         tokio::select! {
             result = &mut watching => result?,

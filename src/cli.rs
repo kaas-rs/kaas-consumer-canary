@@ -248,13 +248,20 @@ mod tests {
     /// flag that was wrong.
     #[test]
     fn the_registry_url_is_checked_here_because_nothing_downstream_checks_it() {
-        assert!(args("http://apicurio:8080/apis/ccompat/v7")
-            .schema_registry_url()
-            .is_ok());
+        assert!(
+            args("http://apicurio:8080/apis/ccompat/v7")
+                .schema_registry_url()
+                .is_ok()
+        );
 
         // https is not a typo but is still unusable: this build has no TLS
         // backend for the registry client. Rejecting it names the reason.
-        let err = format!("{}", args("https://apicurio:8080").schema_registry_url().unwrap_err());
+        let err = format!(
+            "{}",
+            args("https://apicurio:8080")
+                .schema_registry_url()
+                .unwrap_err()
+        );
         assert!(err.contains("no TLS backend"), "{err}");
 
         assert!(args("   ").schema_registry_url().is_err());

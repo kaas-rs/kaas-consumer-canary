@@ -137,7 +137,10 @@ mod tests {
     #[tokio::test]
     async fn bytes_without_the_magic_byte_are_a_framing_failure() {
         let decoder = Decoder::new("http://localhost:8080/apis/ccompat/v7").unwrap();
-        let error = decoder.decode(Some(b"{\"run_id\":\"abc\"}")).await.unwrap_err();
+        let error = decoder
+            .decode(Some(b"{\"run_id\":\"abc\"}"))
+            .await
+            .unwrap_err();
         assert!(matches!(error, DecodeError::Framing(_)), "{error:?}");
     }
 }

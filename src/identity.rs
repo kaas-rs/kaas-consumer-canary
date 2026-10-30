@@ -81,16 +81,15 @@ impl WorkloadIdentity {
         match (client_id, tenant_id, token_file) {
             (None, None, None) => Ok(None),
             (Some(client_id), Some(tenant_id), Some(token_file)) => {
-                let authority = present(AUTHORITY_HOST)
-                    .unwrap_or_else(|| DEFAULT_AUTHORITY.to_owned());
+                let authority =
+                    present(AUTHORITY_HOST).unwrap_or_else(|| DEFAULT_AUTHORITY.to_owned());
                 // `<client-id>/.default` is Entra's way of saying "a token for
                 // this application, with whatever it has been granted". The
                 // `api://` form is the Application ID URI, which the app
                 // registration has to expose — without it the exchange fails at
                 // the issuer with `AADSTS500011`, naming a resource principal
                 // rather than the missing URI.
-                let scope = present(SCOPE)
-                    .unwrap_or_else(|| format!("api://{client_id}/.default"));
+                let scope = present(SCOPE).unwrap_or_else(|| format!("api://{client_id}/.default"));
                 Ok(Some(Self {
                     client_id,
                     tenant_id,
@@ -207,7 +206,10 @@ mod tests {
     #[test]
     fn describe_carries_the_assertion_path_but_never_its_contents() {
         let rendered = identity().describe();
-        assert!(rendered.contains("/var/run/spiffe/svid/azure-token"), "{rendered}");
+        assert!(
+            rendered.contains("/var/run/spiffe/svid/azure-token"),
+            "{rendered}"
+        );
         assert!(rendered.contains("client_id=app-id"), "{rendered}");
     }
 
