@@ -26,10 +26,10 @@
 //! about a URL scheme rather than about the flag that was wrong.
 //!
 //! The check therefore lives at the command line, in
-//! [`crate::cli::Args::schema_registry_url`], which is also where the
-//! `http://`-only restriction this build imposes is enforced. `new` still
-//! returns a `Result` because the builder has other ways to fail, not because
-//! it validates the address.
+//! [`crate::cli::Args::schema_registry_url`], which is also where a scheme
+//! other than `http://` or `https://` is refused. `new` still returns a
+//! `Result` because the builder has other ways to fail, not because it
+//! validates the address.
 //!
 //! # Why decoding is not fatal
 //!
@@ -60,12 +60,27 @@
 //! refuses is a startup failure naming the scope, not a stream of `unparseable`
 //! records that look like the producer's fault.
 //!
-//! The token travels over plain HTTP — `--schema-registry` accepts `http://`
-//! only — which is tolerated because its audience is the registry alone and it
-//! expires within the hour. TLS on the registry is the fix.
+//! Over an `http://` registry the token travels in the clear, which stays
+//! possible because its audience is the registry alone and it expires within
+//! the hour — but an `https://` registry, verified against
+//! `--schema-registry-ca-file`, is the configuration to run.
+//!
+//! # TLS
+//!
+//! The registry client is reqwest, handed a finished rustls `ClientConfig`
+//! that names `ring`, for the reason [`crate::token`]'s connector does: a
+//! process-wide default provider is global state any dependency could install
+//! first. reqwest is built without a provider of its own (`Cargo.toml`), so it
+//! is handed one on every rebuild, `http://` registry or not — without it,
+//! building the client panics. The configuration is made once, in
+//! [`Decoder::new`], and cloned into each rebuild.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use kafka_conn::TokenProvider;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use schema_registry_converter::async_impl::avro::AvroDecoder;
 use schema_registry_converter::async_impl::schema_registry::SrSettings;
 use schema_registry_converter::error::SRCError;
@@ -107,9 +122,76 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
+/// What an `https://` registry's certificate is verified against.
+#[derive(Debug)]
+pub enum RegistryTrust {
+    /// The system trust store. Empty in a scratch image, which is why
+    /// [`Decoder::new`] refuses it for an `https://` registry rather than
+    /// letting every record fail the handshake.
+    System,
+    /// These roots and no others: `--schema-registry-ca-file`.
+    Roots(Vec<CertificateDer<'static>>),
+}
+
+impl RegistryTrust {
+    /// Every certificate in a PEM bundle. Other PEM sections are skipped; a
+    /// bundle with no certificate in it is an error, because an empty trust
+    /// store verifies nothing and would fail every handshake.
+    pub fn from_pem(pem: &[u8]) -> Result<Self> {
+        let roots = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("not a PEM bundle: {e}"))?;
+        if roots.is_empty() {
+            anyhow::bail!("no certificates in the PEM bundle");
+        }
+        Ok(Self::Roots(roots))
+    }
+
+    /// The root store these name. A certificate rustls cannot use is skipped,
+    /// as [`crate::token`] skips one in the system bundle; a bundle of nothing
+    /// but those is an empty store, which [`tls_config`] reports.
+    fn root_store(&self) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        match self {
+            Self::System => {
+                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+            }
+            Self::Roots(certs) => {
+                roots.add_parsable_certificates(certs.iter().cloned());
+            }
+        }
+        roots
+    }
+}
+
+/// The registry client's TLS configuration, with `ring` named rather than
+/// assumed.
+///
+/// An empty root store is refused for an `https://` URL only: an `http://`
+/// registry never reaches the TLS configuration, and in a scratch image the
+/// system store is empty, which must not stop a plaintext registry working.
+fn tls_config(url: &str, trust: &RegistryTrust) -> Result<rustls::ClientConfig> {
+    let roots = trust.root_store();
+    if url.starts_with("https://") && roots.is_empty() {
+        anyhow::bail!(
+            "no usable roots to verify the schema registry at {url} with: \
+             set --schema-registry-ca-file"
+        );
+    }
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("building the schema registry's tls configuration")?
+    .with_root_certificates(roots)
+    .with_no_client_auth())
+}
+
 /// Resolves records against whatever schema they were written with.
 pub struct Decoder {
     url: String,
+    /// Cloned into every inner decoder's HTTP client.
+    tls: rustls::ClientConfig,
     /// Present when the registry requires a token.
     tokens: Option<FederatedTokenProvider>,
     /// Behind a lock because a new token means a new inner decoder, and
@@ -130,13 +212,18 @@ struct Current {
 }
 
 impl Current {
-    fn build(url: &str, token: Option<String>) -> Result<Self, SRCError> {
+    fn build(
+        url: &str,
+        tls: &rustls::ClientConfig,
+        token: Option<String>,
+    ) -> Result<Self, SRCError> {
         let mut builder = SrSettings::new_builder(url.to_owned());
         if let Some(token) = &token {
             builder.set_token_authorization(token);
         }
+        let http = reqwest::Client::builder().tls_backend_preconfigured(tls.clone());
         Ok(Self {
-            inner: AvroDecoder::new(builder.build()?),
+            inner: AvroDecoder::new(builder.build_with(http)?),
             token,
         })
     }
@@ -144,12 +231,17 @@ impl Current {
 
 impl Decoder {
     /// A decoder against the registry at `url`, authenticating with `tokens`
-    /// when given.
+    /// when given, and verifying an `https://` registry against `trust`.
     ///
     /// Reaches no registry yet: the first schema fetch happens when the first
     /// record carrying an unseen id arrives. With `tokens`, it does fetch the
     /// first token now — see the module docs for why that is a startup check.
-    pub async fn new(url: &str, tokens: Option<FederatedTokenProvider>) -> Result<Self> {
+    pub async fn new(
+        url: &str,
+        tokens: Option<FederatedTokenProvider>,
+        trust: &RegistryTrust,
+    ) -> Result<Self> {
+        let tls = tls_config(url, trust)?;
         let token = match &tokens {
             Some(tokens) => Some(
                 tokens
@@ -159,12 +251,13 @@ impl Decoder {
             ),
             None => None,
         };
-        let current = Current::build(url, token)
+        let current = Current::build(url, &tls, token)
             .map_err(anyhow::Error::new)
             .with_context(|| format!("configuring the schema registry client for {url}"))?;
 
         Ok(Self {
             url: url.to_owned(),
+            tls,
             tokens,
             current: RwLock::new(current),
         })
@@ -191,7 +284,8 @@ impl Decoder {
         // Checked again under the write lock: another decode may have rebuilt
         // while this one waited for it.
         if current.token.as_deref() != Some(token.as_str()) {
-            *current = Current::build(&self.url, Some(token)).map_err(DecodeError::Framing)?;
+            *current =
+                Current::build(&self.url, &self.tls, Some(token)).map_err(DecodeError::Framing)?;
             tracing::debug!(
                 "schema registry token refreshed; decoder rebuilt and its schema cache dropped"
             );
@@ -226,9 +320,75 @@ mod tests {
 
     const URL: &str = "http://localhost:8080/apis/ccompat/v7";
 
+    /// A self-signed root with nothing else to it, generated for these tests.
+    const ROOT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBjTCCATOgAwIBAgIUbSEnRzKPlAYmBr5zPnRLC3yLh7cwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQY2FuYXJ5LXRlc3Qtcm9vdDAgFw0yNjEwMzEwNjQ5NDNaGA8y
+MTI2MTAwNzA2NDk0M1owGzEZMBcGA1UEAwwQY2FuYXJ5LXRlc3Qtcm9vdDBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABHUJZMqmXihQ1akrEcIaFO34ShSRlkKSHWIf
+jZYhowPPAQ79BSorTLnZ1mW5HibVwDHpmGDT6bjryQPMD/P0dPajUzBRMB0GA1Ud
+DgQWBBT3eSGaCwDr8UQGf+Vj6XfdaMxygzAfBgNVHSMEGDAWgBT3eSGaCwDr8UQG
+f+Vj6XfdaMxygzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD1
+ZWHSEaEjFc/53Z/TGhaHMyy4CSxZBxNLHNTngx4WLQIgBitEkiBY8Ny43xxu4P2O
+4a95O14YWy2M0nHXvvyNnvY=
+-----END CERTIFICATE-----
+";
+
+    /// The regression `Cargo.toml` warns about: reqwest is built without a
+    /// crypto provider and panics building a client unless it is handed one.
+    /// Nothing in these tests installs a process-wide default, so a decoder
+    /// that builds here was given its provider by [`tls_config`].
+    #[tokio::test]
+    async fn a_decoder_builds_without_a_process_wide_crypto_provider() {
+        let trust = RegistryTrust::from_pem(ROOT_PEM.as_bytes()).unwrap();
+        Decoder::new("https://apicurio:8443/apis/ccompat/v7", None, &trust)
+            .await
+            .unwrap();
+        Decoder::new(URL, None, &RegistryTrust::Roots(Vec::new()))
+            .await
+            .unwrap();
+    }
+
+    /// An https registry with nothing to verify it against would make every
+    /// record unparseable; saying so at startup names the flag that fixes it.
+    #[tokio::test]
+    async fn an_https_registry_with_no_roots_is_refused_up_front() {
+        let Err(err) = Decoder::new(
+            "https://apicurio:8443/apis/ccompat/v7",
+            None,
+            &RegistryTrust::Roots(Vec::new()),
+        )
+        .await
+        else {
+            panic!("an empty trust store was accepted for an https registry");
+        };
+        assert!(
+            err.to_string().contains("--schema-registry-ca-file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_pem_bundle_yields_its_certificates() {
+        let twice = format!("{ROOT_PEM}{ROOT_PEM}");
+        match RegistryTrust::from_pem(twice.as_bytes()).unwrap() {
+            RegistryTrust::Roots(roots) => assert_eq!(roots.len(), 2),
+            RegistryTrust::System => panic!("a bundle is not the system store"),
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_certificate_is_refused() {
+        let err = RegistryTrust::from_pem(b"not a certificate\n").unwrap_err();
+        assert!(err.to_string().contains("no certificates"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_null_value_is_a_tombstone_rather_than_a_parse_failure() {
-        let decoder = Decoder::new(URL, None).await.unwrap();
+        let decoder = Decoder::new(URL, None, &RegistryTrust::System)
+            .await
+            .unwrap();
         let error = decoder.decode(None).await.unwrap_err();
         assert!(matches!(error, DecodeError::Tombstone), "{error:?}");
         // The message has to say which of the three it was: "no value" and
@@ -240,7 +400,9 @@ mod tests {
     /// magic byte is checked first — so this is offline despite the URL.
     #[tokio::test]
     async fn bytes_without_the_magic_byte_are_a_framing_failure() {
-        let decoder = Decoder::new(URL, None).await.unwrap();
+        let decoder = Decoder::new(URL, None, &RegistryTrust::System)
+            .await
+            .unwrap();
         let error = decoder
             .decode(Some(b"{\"run_id\":\"abc\"}"))
             .await
@@ -261,7 +423,7 @@ mod tests {
             "/nonexistent/azure-token",
         )
         .unwrap();
-        let Err(error) = Decoder::new(URL, Some(tokens)).await else {
+        let Err(error) = Decoder::new(URL, Some(tokens), &RegistryTrust::System).await else {
             panic!("a decoder was built without a token");
         };
         let rendered = format!("{error:#}");
@@ -274,7 +436,9 @@ mod tests {
     /// takes.
     #[tokio::test]
     async fn an_anonymous_decoder_never_holds_a_token() {
-        let decoder = Decoder::new(URL, None).await.unwrap();
+        let decoder = Decoder::new(URL, None, &RegistryTrust::System)
+            .await
+            .unwrap();
         assert!(decoder.current().await.unwrap().token.is_none());
     }
 }

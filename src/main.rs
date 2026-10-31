@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let bootstrap = args.bootstrap_servers()?;
     let registry_url = args.schema_registry_url()?;
+    let registry_trust = args.schema_registry_trust()?;
     let session = args.session();
     // Before the first connection, so a half-set identity is reported as the
     // variable that is missing rather than as a handshake that failed — and
@@ -139,7 +140,7 @@ async fn main() -> Result<()> {
     } else {
         "none"
     };
-    let decoder = Decoder::new(registry_url, registry_tokens).await?;
+    let decoder = Decoder::new(registry_url, registry_tokens, &registry_trust).await?;
     let mut watch = Watch::new(args.thresholds());
 
     // Built once and shared by every rejoin: the SASL config holds its token

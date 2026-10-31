@@ -155,7 +155,7 @@ Two things suppress it rather than report it:
 |---|---|---|---|
 | `--bootstrap` | `KAAS_CANARY_BOOTSTRAP` | — | comma-separated `host:port` |
 | `--topic` | `KAAS_CANARY_TOPIC` | `kaas-canary` | |
-| `--schema-registry` | `KAAS_CANARY_SCHEMA_REGISTRY` | — | ccompat base URL; `http://` only |
+| `--schema-registry` | `KAAS_CANARY_SCHEMA_REGISTRY` | — | ccompat base URL, `http://` or `https://` |
 | `--group` | `KAAS_CANARY_GROUP` | `kaas-consumer-canary` | where committed offsets live |
 | `--instance-id` | `KAAS_CANARY_INSTANCE_ID` | — | static membership; a restart is not a rebalance |
 | `--interval-ms` | `KAAS_CANARY_INTERVAL_MS` | `1000` | what the producer is writing at |
@@ -167,6 +167,7 @@ Two things suppress it rather than report it:
 | `--count` | | — | stop after N heartbeats; runs forever when unset |
 | `--strict` | | off | exit non-zero if anything was found |
 | `--ca-file` | `KAAS_CANARY_CA_FILE` | system roots | PEM bundle to trust for the Kafka connection |
+| `--schema-registry-ca-file` | `KAAS_CANARY_SCHEMA_REGISTRY_CA_FILE` | system roots | PEM bundle to trust for an `https://` registry |
 
 The shared environment variables are the producer's, on purpose: a producer and
 its reader configured from one environment agree about the topic, the interval
@@ -177,6 +178,13 @@ the producer: every record is Avro framed with a schema id, so a reader without 
 registry cannot resolve a single one. Starting anyway would mean counting the
 whole stream as unparseable — which looks exactly like the producer having
 broken, and is the failure this crate spent a while actually having.
+
+An `https://` registry is verified against `--schema-registry-ca-file`, or the
+system roots when it is unset — and the release image has none, so an
+in-cluster registry behind a private CA needs the flag. It is separate from
+`--ca-file` for the producer's reason: the Kafka listener's CA and the
+registry's are usually different. Setting it beside an `http://` URL is an
+error rather than a no-op.
 
 ## The payload is Avro, and the schema comes off the wire
 

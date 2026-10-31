@@ -81,14 +81,21 @@ rustls-native-certs = "0.8"
 # the crate's options reach for a C project (OpenSSL, or `aws-lc-sys` and
 # cmake), either of which costs the release image its "static musl, one build
 # package" property and puts a second crypto provider into the same `rustls`
-# used above for the Kafka connection. `--schema-registry` therefore takes
-# `http://` only, which in-cluster is the whole requirement.
+# used above for the Kafka connection. TLS to the registry comes from `reqwest`
+# below instead.
 #
 # `apache-avro` is direct because decoding resolves a datum into `Heartbeat`,
 # and its version must track whatever `schema_registry_converter` resolves — the
 # `Value` handed to `from_value` is that crate's type, not ours.
 schema_registry_converter = { version = "4.10", default-features = false, features = ["avro", "futures"] }
 apache-avro = "0.21"
+# The registry client's TLS, on the one copy of reqwest the converter already
+# brings. `rustls-no-provider` adds rustls with no crypto provider of its own,
+# so no aws-lc. It also leaves reqwest with nothing to fall back on: building
+# a client panics unless a process-wide default is installed. This crate
+# installs none, for the reason above `rustls`, and hands reqwest a finished
+# `ClientConfig` naming `ring` instead (`registry.rs`).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 # `sync` for the token cache and the decoder's lock. It used to arrive only
 # through kaas-lib's own tokio features, which is not a dependency to lean on.
