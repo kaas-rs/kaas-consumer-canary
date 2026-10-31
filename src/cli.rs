@@ -15,6 +15,7 @@ use clap::Parser;
 use kafka_conn::TlsConfig;
 
 use crate::reader::Session;
+use crate::registry::RegistryTrust;
 use crate::watch::Thresholds;
 
 #[derive(Debug, Parser)]
@@ -133,6 +134,20 @@ pub struct Args {
     /// handshake failure at connect, not a later authentication error.
     #[arg(long, env = "KAAS_CANARY_CA_FILE")]
     pub ca_file: Option<PathBuf>,
+
+    /// PEM bundle to trust for an `https://` schema registry.
+    ///
+    /// Its own flag rather than `--ca-file`, because the two are usually
+    /// different CAs: Strimzi signs its listeners with a per-cluster CA, and
+    /// the registry's certificate comes from wherever the platform issues
+    /// service certificates. Nothing joins the two.
+    ///
+    /// Unset means the system roots — of which a scratch image has none, so
+    /// an in-cluster registry over TLS needs this. Naming it for an `http://`
+    /// registry is refused rather than ignored: the likelier story is a URL
+    /// that lost its `s`.
+    #[arg(long, env = "KAAS_CANARY_SCHEMA_REGISTRY_CA_FILE")]
+    pub schema_registry_ca_file: Option<PathBuf>,
 }
 
 impl Args {
@@ -172,26 +187,42 @@ impl Args {
         )
     }
 
-    /// The registry URL, checked for the one thing this build cannot do.
+    /// The registry URL, checked for a scheme the client can speak.
     ///
-    /// `schema_registry_converter` is compiled without a TLS backend here —
-    /// `Cargo.toml` says why, and it is a decision about the release image
-    /// rather than about the registry. The consequence is that an `https://`
-    /// URL fails inside reqwest, at the first record, with a message about URL
-    /// schemes. Catching it at the boundary means the error names the flag that
-    /// was wrong instead.
+    /// Anything but `http://` or `https://` would fail inside reqwest, at the
+    /// first record, with a message about URL schemes. Catching it at the
+    /// boundary means the error names the flag that was wrong instead.
     pub fn schema_registry_url(&self) -> Result<&str> {
         let url = self.schema_registry.trim();
         if url.is_empty() {
             anyhow::bail!("--schema-registry is empty");
         }
-        if !url.starts_with("http://") {
-            anyhow::bail!(
-                "--schema-registry must be an http:// URL, got {url:?} — \
-                 this build has no TLS backend, see Cargo.toml"
-            );
+        if url.starts_with("http://") {
+            if self.schema_registry_ca_file.is_some() {
+                anyhow::bail!(
+                    "--schema-registry-ca-file is set but --schema-registry is \
+                     plain http ({url:?}); did the URL lose its https?"
+                );
+            }
+        } else if !url.starts_with("https://") {
+            anyhow::bail!("--schema-registry must be an http:// or https:// URL, got {url:?}");
         }
         Ok(url)
+    }
+
+    /// What to verify an `https://` registry against.
+    ///
+    /// Read and parsed here, for the reason [`Args::tls_config`] reads its
+    /// bundle here: an unreadable or empty file is reported as the flag that
+    /// named it, at startup, rather than as every record being unparseable.
+    pub fn schema_registry_trust(&self) -> Result<RegistryTrust> {
+        let Some(path) = &self.schema_registry_ca_file else {
+            return Ok(RegistryTrust::System);
+        };
+        let pem = std::fs::read(path)
+            .with_context(|| format!("reading --schema-registry-ca-file {}", path.display()))?;
+        RegistryTrust::from_pem(&pem)
+            .with_context(|| format!("parsing --schema-registry-ca-file {}", path.display()))
     }
 
     /// What to trust for the Kafka connection.
@@ -233,13 +264,19 @@ mod tests {
     use super::*;
 
     fn args(registry: &str) -> Args {
-        Args::parse_from([
+        with_registry_ca(registry, &[])
+    }
+
+    fn with_registry_ca(registry: &str, extra: &[&str]) -> Args {
+        let mut argv = vec![
             "kaas-consumer-canary",
             "--bootstrap",
             "broker:9092",
             "--schema-registry",
             registry,
-        ])
+        ];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
     }
 
     /// The boundary the `registry` module deliberately does not have. `SrSettings`
@@ -248,22 +285,54 @@ mod tests {
     /// flag that was wrong.
     #[test]
     fn the_registry_url_is_checked_here_because_nothing_downstream_checks_it() {
-        assert!(
-            args("http://apicurio:8080/apis/ccompat/v7")
-                .schema_registry_url()
-                .is_ok()
-        );
+        for url in [
+            "http://apicurio:8080/apis/ccompat/v7",
+            "https://apicurio:8443/apis/ccompat/v7",
+        ] {
+            assert_eq!(args(url).schema_registry_url().unwrap(), url);
+        }
 
-        // https is not a typo but is still unusable: this build has no TLS
-        // backend for the registry client. Rejecting it names the reason.
         let err = format!(
             "{}",
-            args("https://apicurio:8080")
-                .schema_registry_url()
-                .unwrap_err()
+            args("apicurio:8080").schema_registry_url().unwrap_err()
         );
-        assert!(err.contains("no TLS backend"), "{err}");
+        assert!(err.contains("http:// or https://"), "{err}");
 
         assert!(args("   ").schema_registry_url().is_err());
+    }
+
+    /// A CA for a plaintext registry configures nothing. Ignoring it would
+    /// hide the likelier mistake: the URL was meant to be `https://`.
+    #[test]
+    fn a_registry_ca_beside_an_http_url_is_refused() {
+        let err = with_registry_ca(
+            "http://apicurio:8080",
+            &["--schema-registry-ca-file", "/etc/trust-bundle/ca.crt"],
+        )
+        .schema_registry_url()
+        .unwrap_err();
+        assert!(err.to_string().contains("lose its https"), "{err}");
+    }
+
+    #[test]
+    fn no_registry_ca_means_the_system_store() {
+        let trust = args("https://apicurio:8443")
+            .schema_registry_trust()
+            .unwrap();
+        assert!(matches!(trust, RegistryTrust::System));
+    }
+
+    #[test]
+    fn an_unreadable_registry_ca_names_the_flag() {
+        let err = with_registry_ca(
+            "https://apicurio:8443",
+            &["--schema-registry-ca-file", "/nonexistent/ca.crt"],
+        )
+        .schema_registry_trust()
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--schema-registry-ca-file"),
+            "{err:#}"
+        );
     }
 }
